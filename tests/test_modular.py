@@ -333,25 +333,29 @@ def test_classic_trojans():
     ct._list_shares = lambda: []
 
     mod = ct.Module()
-    ctx = Context(app_dir=tempfile.mkdtemp(prefix="fk_ct_", dir=ROOT))
-    det = mod.run("detect", ctx, lambda m: None)
-    hi = [r for r in det.data["rows"] if r["level"] == "高危"]
-    assert len(hi) == 4, [(r["kind"], r["value"]) for r in hi]
-    assert len(det.report["fixable"]) == 4
-    assert all("Good" not in r["value"] or r["level"] == "信息"
-               for r in det.data["rows"] if r["kind"] == "启动项")
+    app_tmp = tempfile.mkdtemp(prefix="fk_ct_", dir=ROOT)
+    try:
+        ctx = Context(app_dir=app_tmp)
+        det = mod.run("detect", ctx, lambda m: None)
+        hi = [r for r in det.data["rows"] if r["level"] == "高危"]
+        assert len(hi) == 4, [(r["kind"], r["value"]) for r in hi]
+        assert len(det.report["fixable"]) == 4
+        assert all("Good" not in r["value"] or r["level"] == "信息"
+                   for r in det.data["rows"] if r["kind"] == "启动项")
 
-    fixed = mod.run("fix", ctx, lambda m: None)
-    assert not [r for r in fixed.data["rows"] if r["level"] == "高危"], "修复后不得残留高危"
-    assert len(deleted) == 3 and len(sets_) == 1 and "NOTEPAD" in sets_[0][3].upper()
-    mf = json.load(open(os.path.join(fixed.report["fixed_backup_dir"], "manifest.json"),
-                        encoding="utf-8"))
-    assert len(mf["applied"]) == 4
+        fixed = mod.run("fix", ctx, lambda m: None)
+        assert not [r for r in fixed.data["rows"] if r["level"] == "高危"], "修复后不得残留高危"
+        assert len(deleted) == 3 and len(sets_) == 1 and "NOTEPAD" in sets_[0][3].upper()
+        mf = json.load(open(os.path.join(fixed.report["fixed_backup_dir"], "manifest.json"),
+                            encoding="utf-8"))
+        assert len(mf["applied"]) == 4
 
-    rb = mod.run("rollback", ctx, lambda m: None)
-    assert rb.report["restored"] == 4, rb.report
-    assert fake[hklm_run].get("KV2004") and fake[assoc][""][0].startswith("c:")
-    print("[OK] 经典木马查杀: 注入检出 4 高危 / 修复删值3+还原关联1 / 回滚 4；真实主机 0 高危")
+        rb = mod.run("rollback", ctx, lambda m: None)
+        assert rb.report["restored"] == 4, rb.report
+        assert fake[hklm_run].get("KV2004") and fake[assoc][""][0].startswith("c:")
+        print("[OK] 经典木马查杀: 注入检出 4 高危 / 修复删值3+还原关联1 / 回滚 4；真实主机 0 高危")
+    finally:
+        shutil.rmtree(app_tmp, ignore_errors=True)
 
 
 def test_signature_db_pack():
