@@ -359,7 +359,8 @@ class Module(ModuleBase):
                          % (summary_infected, rc, log_file),
             })
 
-            if rc not in (0, 1) and not found:
+            partial = rc not in (0, 1)
+            if partial and not found:
                 tail = ((out or "") + "\n" + (err or "")).strip()[-1200:]
                 return ActionResult(
                     action=action_id, ok=False,
@@ -367,12 +368,25 @@ class Module(ModuleBase):
                     show_dialog=False, data={"rows": rows},
                     report={"returncode": rc, "log_file": log_file},
                 )
+            if partial:
+                # 有命中但返回码异常：结果仍给出，但必须明示"扫描不完整"，不静默吞错
+                tail = ((out or "") + "\n" + (err or "")).strip()[-600:]
+                rows.append({
+                    "id": "clamav", "type": "partial_error", "level": "关注",
+                    "path": "(扫描完整性)",
+                    "value": "返回码 %d：扫描部分出错，以上结果可能不完整%s"
+                             % (rc, ("：" + tail) if tail else ""),
+                })
 
+            warn = ""
+            if partial:
+                warn = ("\n\n注意：返回码 %d 表示扫描部分出错，本次结果可能不完整，建议修复后重扫。"
+                        % rc)
             msg = (
-                "ClamAV 外部扫描完成：感染报告 %s 项，返回码 %d。\n"
+                "ClamAV 外部扫描完成：感染报告 %s 项，返回码 %d。%s\n"
                 "引擎：%s（%s）\n日志：%s\n\n"
                 "命中需人工复核；本工具未隔离、未删除任何文件。"
-                % (summary_infected, rc, version, arch, log_file)
+                % (summary_infected, rc, warn, version, arch, log_file)
             )
             return ActionResult(
                 action=action_id, ok=True, message=msg, title="ClamAV 扫描",
@@ -380,6 +394,7 @@ class Module(ModuleBase):
                 report={
                     "clamscan": exe, "version": version, "arch": arch,
                     "target": ctx.target, "returncode": rc,
+                    "partial_error": partial,
                     "log_file": log_file,
                     "infected": len(found),
                     "summary_infected": summary_infected,

@@ -7,7 +7,7 @@
 
 可用能力：
   - meta: 模块身份与排序
-  - actions(): 定义按钮；target_mode 可选 required / optional / none
+  - actions(): 定义按钮；target_mode 取 required（必须有目标）/ none（不需要目标）
   - prepare_context(): 解析目标路径（仅 required 时调用）
   - build_view(): 返回一个 tkinter 控件作为标签页
   - render(): 在主线程刷新标签页

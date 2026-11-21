@@ -138,29 +138,39 @@ def _reg_value(hive, subkey, name=""):
 
 
 def collect_wmi(log=lambda m: None):
-    """只读：WMI 事件订阅的命令行消费者。键不存在=无订阅，不报异常。"""
+    r"""只读：WMI 事件订阅的命令行消费者。
+
+    键结构：EventSubscriptions\{GUID}\<ConsumerClass>\{GUID}，
+    CommandLineTemplate 值在最内层消费者 GUID 键下。
+    键不存在=无订阅，不报异常。
+    """
     rows = []
     if winreg is None:
         return rows
+    B = chr(92)
     for hive, label in ((winreg.HKEY_LOCAL_MACHINE, "HKLM"), (winreg.HKEY_CURRENT_USER, "HKCU")):
-        names = _reg_subkeys(hive, WMI_SUBSCRIPTIONS)
-        for name in names:
-            consumer = _reg_value(
-                hive, WMI_SUBSCRIPTIONS + chr(92) + name + chr(92) + "CommandLineEventConsumer"
-            )
-            if consumer is None:
-                continue
-            consumer = str(consumer)
-            level, detail = _level_for_executable(consumer)
-            if SAFE_PATH_RE.search(consumer):
-                continue
-            level = LEVEL_HIGH if level != LEVEL_INFO else LEVEL_WARN
-            detail = "WMI 事件订阅可在事件触发时执行命令（高危持久化点，需人工确认）"
-            rows.append(_row(
-                "WMI订阅", level,
-                label + chr(92) + WMI_SUBSCRIPTIONS + chr(92) + name + chr(92) + "CommandLineTemplate",
-                consumer[:300], detail,
-            ))
+        for guid in _reg_subkeys(hive, WMI_SUBSCRIPTIONS):
+            base = WMI_SUBSCRIPTIONS + B + guid
+            for cls in _reg_subkeys(hive, base):
+                # 只看 *EventConsumer 类目录，过滤绑定/过滤项等无关子键
+                if "Consumer" not in cls:
+                    continue
+                cls_base = base + B + cls
+                for cg in _reg_subkeys(hive, cls_base):
+                    tmpl = _reg_value(hive, cls_base + B + cg, "CommandLineTemplate")
+                    if tmpl is None:
+                        continue
+                    tmpl = str(tmpl)
+                    if SAFE_PATH_RE.search(tmpl):
+                        continue
+                    level, _ = _level_for_executable(tmpl)
+                    level = LEVEL_HIGH if level != LEVEL_INFO else LEVEL_WARN
+                    rows.append(_row(
+                        "WMI订阅", level,
+                        label + B + cls_base + B + cg + B + "CommandLineTemplate",
+                        tmpl[:300],
+                        "WMI 事件订阅可在事件触发时执行命令（高危持久化点，需人工确认）",
+                    ))
     log("WMI 事件订阅检查完成：%d 条。" % len(rows))
     return rows
 
@@ -232,25 +242,45 @@ def collect_bho(log=lambda m: None):
 
 
 def collect_file_associations(log=lambda m: None):
-    """只读：脚本扩展名的 open command 是否被改为非标准脚本宿主。"""
+    r"""只读：脚本扩展名的 open command 是否被改为非标准脚本宿主。
+
+    标准劫持手法改的是 ProgID（HKCR\<ext> 默认值 -> HKCR\<ProgID>\shell\open\command），
+    直挂扩展名键的手法同样覆盖，两层都查。
+    """
     rows = []
     if winreg is None:
         return rows
+    B = chr(92)
+    seen = set()
     for ext in FILE_ASSOC_EXTS:
-        cmd = _reg_value(
-            winreg.HKEY_CLASSES_ROOT, ext + chr(92) + "shell" + chr(92) + "open" + chr(92) + "command"
-        )
-        if cmd is None:
-            continue
-        cmd = str(cmd)
-        if SCRIPT_HOST_RE.search(cmd) or SAFE_PATH_RE.search(cmd):
-            continue
-        rows.append(_row(
-            "文件关联", LEVEL_HIGH,
-            "HKCR" + chr(92) + ext + chr(92) + "shell" + chr(92) + "open" + chr(92) + "command",
-            cmd[:300],
-            "脚本文件默认打开程序不是已知脚本宿主（劫持指标，需人工确认）",
-        ))
+        targets = []
+        # 第一层：扩展名直挂键（少数手法直接改这里）
+        cmd = _reg_value(winreg.HKEY_CLASSES_ROOT, ext + B + "shell" + B + "open" + B + "command")
+        if cmd is not None:
+            targets.append(("HKCR" + B + ext + B + "shell" + B + "open" + B + "command", str(cmd)))
+        # 第二层：扩展名默认值 -> ProgID 的 open command（标准布局，主流劫持点）
+        progid = _reg_value(winreg.HKEY_CLASSES_ROOT, ext)
+        if isinstance(progid, str) and progid.strip():
+            progid = progid.strip()
+            pcmd = _reg_value(
+                winreg.HKEY_CLASSES_ROOT, progid + B + "shell" + B + "open" + B + "command"
+            )
+            if pcmd is not None:
+                targets.append(
+                    ("HKCR" + B + progid + B + "shell" + B + "open" + B + "command", str(pcmd))
+                )
+        for path_label, cmd_s in targets:
+            if cmd_s in seen:  # 多扩展名共享同一 ProgID 时去重
+                continue
+            seen.add(cmd_s)
+            if SCRIPT_HOST_RE.search(cmd_s) or SAFE_PATH_RE.search(cmd_s):
+                continue
+            rows.append(_row(
+                "文件关联", LEVEL_HIGH,
+                path_label,
+                cmd_s[:300],
+                "脚本文件默认打开程序不是已知脚本宿主（劫持指标，需人工确认）",
+            ))
     log("脚本文件关联检查完成：%d 条。" % len(rows))
     return rows
 

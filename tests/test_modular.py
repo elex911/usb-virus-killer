@@ -10,7 +10,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 sys.path.insert(0, ROOT)
 
 from core.registry import load_modules
-from core.api import Context, ModuleBase
+from core.api import ActionResult, Context, ModuleBase
 from modules import folder_virus as fv
 from modules import signature_db as sig
 from modules import clamav_bridge as cb
@@ -241,18 +241,60 @@ def test_modern_threats():
     assert all(set(r.keys()) == {"kind", "level", "path", "value", "detail"}
                for r in real.data["rows"])
 
-    # 注入 WMI：临时路径应报高危，系统路径应被降噪跳过
+    # 注入 WMI：三层键结构（订阅 GUID -> Consumer 类 -> Consumer GUID），
+    # 临时路径应报高危，系统路径应被降噪跳过
+    sub_guid = "{11111111-1111-1111-1111-111111111111}"
+    evil_guid, safe_guid = "{22222222-2222-2222-2222-222222222222}", "{33333333-3333-3333-3333-333333333333}"
+    consumer_cls = "CommandLineEventConsumer"
+    cls_base = mt.WMI_SUBSCRIPTIONS + B + sub_guid + B + consumer_cls
+
+    def fake_subkeys(hive, subkey):
+        if subkey == mt.WMI_SUBSCRIPTIONS:
+            return [sub_guid]
+        if subkey == mt.WMI_SUBSCRIPTIONS + B + sub_guid:
+            return [consumer_cls]
+        if subkey == cls_base:
+            return [evil_guid, safe_guid]
+        return []
+
+    def fake_value(hive, subkey, name=""):
+        if name == "CommandLineTemplate":
+            if subkey == cls_base + B + evil_guid:
+                return temp_exe
+            if subkey == cls_base + B + safe_guid:
+                return sys_exe
+        return None
+
     orig_sub, orig_val = mt._reg_subkeys, mt._reg_value
-    mt._reg_subkeys = lambda hive, subkey: (["EvilConsumer", "SafeConsumer"]
-                                            if subkey == mt.WMI_SUBSCRIPTIONS else [])
-    mt._reg_value = lambda hive, subkey, name="": (
-        temp_exe if "EvilConsumer" in subkey else sys_exe
-    ) if "CommandLineEventConsumer" in subkey else None
+    mt._reg_subkeys, mt._reg_value = fake_subkeys, fake_value
     try:
         wmi = mt.collect_wmi()
     finally:
         mt._reg_subkeys, mt._reg_value = orig_sub, orig_val
-    assert len(wmi) == 2 and all(r["level"] == "高危" for r in wmi), wmi
+    assert len(wmi) == 2 and all(r["level"] == "高危" for r in wmi), wmi  # HKLM/HKCU 各 1 条（SAFE 降噪）
+    assert all(r["path"].endswith(B + evil_guid + B + "CommandLineTemplate") for r in wmi), wmi
+
+    # 注入文件关联：ProgID 间接劫持应检出（.js 默认值指向自定义 ProgID），
+    # 标准脚本宿主（VBSFile -> wscript.exe）应跳过，直挂键缺失不报错
+    assoc_table = {
+        ".js": "evilprog",
+        ".js" + B + "shell" + B + "open" + B + "command": None,
+        "evilprog" + B + "shell" + B + "open" + B + "command": temp_exe,
+        ".vbs": "VBSFile",
+        "VBSFile" + B + "shell" + B + "open" + B + "command": sys_exe + B + "wscript.exe " + chr(34) + "%1" + chr(34) + " %*",
+    }
+    orig_val2 = mt._reg_value
+
+    def fake_assoc_value(hive, subkey, name=""):
+        return assoc_table.get(subkey)
+
+    mt._reg_value = fake_assoc_value
+    try:
+        assoc = mt.collect_file_associations()
+    finally:
+        mt._reg_value = orig_val2
+    assert len(assoc) == 1 and assoc[0]["level"] == "高危", assoc
+    assert "evilprog" in assoc[0]["path"], assoc
 
     # 反查假零命中：UTF-16LE 路径抽取必须命中
     extracted = mt._strings_from_binary(temp_exe.encode("utf-16-le"))
@@ -305,7 +347,7 @@ def test_classic_trojans():
     hkcu_run = ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
     fake[hklm_run] = {"KV2004": (r"C:\Windows\microsoft.exe", 1),
                       "Good": (r"C:\Program Files (x86)\App\App.exe", 1)}
-    fake[hkcu_run] = {"WebAuto": (r"C:\Windows\System32\WebAuto.exe", 1)}
+    fake[hkcu_run] = {"WebAuto": (r"C:\Windows\System32\WebAuto.exe", 2)}  # 2=REG_EXPAND_SZ，验证回滚保类型
     assoc = ("HKCR", ct.TXTFILE_ASSOC)
     fake[assoc] = {"": (r'c:\windows\winsoft "%1"', 1)}
     ifeo = ("HKLM", ct.IFEOSUB + "\\evil.exe")
@@ -321,6 +363,7 @@ def test_classic_trojans():
 
     ct._reg_enum_values = lambda h, sk: [(n, v, t) for n, (v, t) in fake.get((hive_name(h), sk), {}).items()]
     ct._reg_get = lambda h, sk, n: fake.get((hive_name(h), sk), {}).get(n, (None,))[0]
+    ct._reg_get_ex = lambda h, sk, n: fake.get((hive_name(h), sk), {}).get(n)
     ct._reg_delete_value = lambda h, sk, n: (deleted.append((hive_name(h), sk, n)),
                                              fake.get((hive_name(h), sk), {}).pop(n, None))
     def _set(h, sk, n, v, t):
@@ -343,6 +386,34 @@ def test_classic_trojans():
         assert all("Good" not in r["value"] or r["level"] == "信息"
                    for r in det.data["rows"] if r["kind"] == "启动项")
 
+        # 中途异常：第 2 次删除时抛错 → manifest 已逐项落盘，已改的第 1 项仍可回滚
+        orig_del = ct._reg_delete_value
+        calls = {"n": 0}
+
+        def flaky_del(h, sk, n):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("模拟修复中途失败")
+            return orig_del(h, sk, n)
+
+        ct._reg_delete_value = flaky_del
+        raised = False
+        try:
+            mod._do_fix(ctx, lambda m: None)
+        except OSError:
+            raised = True
+        assert raised, "注入的失败未触发"
+        assert len(deleted) == 1, deleted  # 第 1 项已改、第 2 项失败
+        backup_root = os.path.join(app_tmp, "legacy_fix_backups")
+        latest = sorted(os.listdir(backup_root))[-1]
+        mf = json.load(open(os.path.join(backup_root, latest, "manifest.json"), encoding="utf-8"))
+        assert len(mf["applied"]) == 1 and mf["applied"][0]["name"] == "KV2004", mf
+        msg, n_rb = mod._do_rollback(ctx, lambda m: None)
+        assert n_rb == 1 and fake[hklm_run].get("KV2004"), (msg, fake[hklm_run])
+        ct._reg_delete_value = orig_del  # 还原正常删除接缝，进入完整链路
+
+        deleted.clear()
+        sets_.clear()
         fixed = mod.run("fix", ctx, lambda m: None)
         assert not [r for r in fixed.data["rows"] if r["level"] == "高危"], "修复后不得残留高危"
         assert len(deleted) == 3 and len(sets_) == 1 and "NOTEPAD" in sets_[0][3].upper()
@@ -353,7 +424,8 @@ def test_classic_trojans():
         rb = mod.run("rollback", ctx, lambda m: None)
         assert rb.report["restored"] == 4, rb.report
         assert fake[hklm_run].get("KV2004") and fake[assoc][""][0].startswith("c:")
-        print("[OK] 经典木马查杀: 注入检出 4 高危 / 修复删值3+还原关联1 / 回滚 4；真实主机 0 高危")
+        assert fake[hkcu_run]["WebAuto"][1] == 2, "回滚必须保留 REG_EXPAND_SZ 原类型"
+        print("[OK] 经典木马查杀: 检出4高危 / 中途异常逐项备份+回滚 / 完整修复回滚4 / REG_EXPAND_SZ 保类型")
     finally:
         shutil.rmtree(app_tmp, ignore_errors=True)
 
@@ -438,6 +510,38 @@ def test_clamav_log_not_contaminated():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_clamav_partial_error():
+    """rc=2 且有命中：结果仍给出，但必须明示「扫描部分出错」，不静默吞错。"""
+    tmp = tempfile.mkdtemp(prefix="fk_clam_perr_", dir=ROOT)
+    try:
+        original = cb._run_process
+
+        def fake_run(cmd, timeout):
+            if not any("--recursive" in c for c in cmd):
+                return (0, "ClamAV 1.5.5", "")  # 版本探测等前置调用
+            log_path = cmd[2].split("=", 1)[1]
+            with open(log_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write("X:\\target\\bad.exe: Eicar-Test-Signature FOUND\n"
+                        "----------- SCAN SUMMARY -----------\nInfected files: 1\n")
+            return (2, "", "LibClamAV Error: some files could not be scanned")
+
+        cb._run_process = fake_run
+        try:
+            ctx = Context(app_dir=tmp)
+            ctx.target = tmp
+            ctx.is_drive = False
+            res = cb.Module().run("scan", ctx, lambda m: None)
+            assert res.ok and res.report["partial_error"] is True, res.report
+            assert "部分出错" in res.message, res.message
+            assert res.report["summary_infected"] == 1, res.report
+            assert any(r.get("type") == "partial_error" for r in res.data["rows"]), res.data["rows"]
+            print("[OK] ClamAV rc=2: 保留命中结果并明示扫描不完整")
+        finally:
+            cb._run_process = original
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_freshclam_summary():
     """更新结果必须给中文结论，不把原始英文输出与返回码糊到弹窗里。"""
     upstream = (
@@ -472,51 +576,66 @@ def test_amsi_scan():
     mod = am.Module()
 
     tmp = tempfile.mkdtemp(prefix="fk_amsi_a_", dir=ROOT)
-    with open(os.path.join(tmp, "a.ps1"), "w", encoding="utf-8") as f:
-        f.write("Write-Host hello\n")
-    ctx = Context(app_dir=tempfile.mkdtemp(prefix="fk_amsi_b_", dir=ROOT))
-    ctx.target = tmp
-    am._load_amsi = lambda: None
-    res = mod.run("scan", ctx, lambda m: None)
-    assert res.ok and res.report["amsi"]["available"] is False
-    assert "跳过" in res.message
+    app_dir = tempfile.mkdtemp(prefix="fk_amsi_b_", dir=ROOT)
+    tmp2 = None
+    try:
+        with open(os.path.join(tmp, "a.ps1"), "w", encoding="utf-8") as f:
+            f.write("Write-Host hello\n")
+        ctx = Context(app_dir=app_dir)
+        ctx.target = tmp
+        am._load_amsi = lambda: None
+        res = mod.run("scan", ctx, lambda m: None)
+        assert res.ok and res.report["amsi"]["available"] is False
+        assert "跳过" in res.message
 
-    am._reset_seams()
+        am._reset_seams()
 
-    def fake_scan(api, data, name):
-        if name.endswith(".vbs"):
-            return (0, 1)
-        if name.endswith(".js"):
-            return (0, 2000)
-        return (0, 0)
+        def fake_scan(api, data, name):
+            if name.endswith(".vbs"):
+                return (0, 1)
+            if name.endswith(".js"):
+                return (0, 2000)
+            return (0, 0)
 
-    am._amsi_scan = fake_scan
-    tmp2 = tempfile.mkdtemp(prefix="fk_amsi_c_", dir=ROOT)
-    with open(os.path.join(tmp2, "evil.vbs"), "w") as f:
-        f.write("x=1\n")
-    with open(os.path.join(tmp2, "sus.js"), "w") as f:
-        f.write("y=2\n")
-    with open(os.path.join(tmp2, "note.txt"), "w") as f:
-        f.write("z=3\n")
-    os.makedirs(os.path.join(tmp2, "sub__WORM_QUARANTINE_x"))
-    with open(os.path.join(tmp2, "sub__WORM_QUARANTINE_x", "q.vbs"), "w") as f:
-        f.write("skip\n")
-    ctx2 = Context(); ctx2.target = tmp2
-    res2 = mod.run("scan", ctx2, lambda m: None)
-    rows = res2.data["rows"]
-    hi = [r for r in rows if r["level"] == "高危"]
-    wa = [r for r in rows if r["level"] == "关注"]
-    assert len(hi) == 1 and hi[0]["path"].endswith("evil.vbs"), hi
-    assert len(wa) == 1 and wa[0]["path"].endswith("sus.js"), wa
-    assert not any("q.vbs" in r["path"] or "note.txt" in r["path"] for r in rows)
-    assert res2.report["amsi"]["detected"] == 1 and res2.report["amsi"]["suspicious"] == 1
-    print("[OK] AMSI 扫描: 降级跳过 + 注入检出 高危1/关注1，隔离目录与非脚本不扫")
+        am._amsi_scan = fake_scan
+        tmp2 = tempfile.mkdtemp(prefix="fk_amsi_c_", dir=ROOT)
+        with open(os.path.join(tmp2, "evil.vbs"), "w") as f:
+            f.write("x=1\n")
+        with open(os.path.join(tmp2, "sus.js"), "w") as f:
+            f.write("y=2\n")
+        with open(os.path.join(tmp2, "note.txt"), "w") as f:
+            f.write("z=3\n")
+        os.makedirs(os.path.join(tmp2, "sub__WORM_QUARANTINE_x"))
+        with open(os.path.join(tmp2, "sub__WORM_QUARANTINE_x", "q.vbs"), "w") as f:
+            f.write("skip\n")
+        ctx2 = Context(); ctx2.target = tmp2
+        res2 = mod.run("scan", ctx2, lambda m: None)
+        rows = res2.data["rows"]
+        hi = [r for r in rows if r["level"] == "高危"]
+        wa = [r for r in rows if r["level"] == "关注"]
+        assert len(hi) == 1 and hi[0]["path"].endswith("evil.vbs"), hi
+        assert len(wa) == 1 and wa[0]["path"].endswith("sus.js"), wa
+        assert not any("q.vbs" in r["path"] or "note.txt" in r["path"] for r in rows)
+        assert res2.report["amsi"]["detected"] == 1 and res2.report["amsi"]["suspicious"] == 1
+        print("[OK] AMSI 扫描: 降级跳过 + 注入检出 高危1/关注1，隔离目录与非脚本不扫")
+    finally:
+        am._reset_seams()
+        for d in (tmp, app_dir, tmp2):
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
 
 
 def test_fp_feedback():
     """误报候选登记：报告解析 / 去重 / 查看 / 校验提示。"""
     from modules import signature_db as sig
     app_dir = tempfile.mkdtemp(prefix="fk_fp_", dir=ROOT)
+    try:
+        _fp_feedback_body(app_dir)
+    finally:
+        shutil.rmtree(app_dir, ignore_errors=True)
+
+
+def _fp_feedback_body(app_dir):
     matches = [
         {"id": "R1", "type": "filename_regex", "level": "命中",
          "path": "C:/x/evil.exe", "value": "evil.*",
@@ -551,6 +670,13 @@ def test_fixscript():
     """修复脚本导出：默认全注释、命令映射正确、信息级排除、未诊断拒绝。"""
     from modules import host_diagnostics as hd
     app_dir = tempfile.mkdtemp(prefix="fk_fx_", dir=ROOT)
+    try:
+        _fixscript_body(hd, app_dir)
+    finally:
+        shutil.rmtree(app_dir, ignore_errors=True)
+
+
+def _fixscript_body(hd, app_dir):
     rows = [
         {"kind": "自启动", "level": "高危",
          "path": r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\KV2004",
@@ -580,6 +706,45 @@ def test_fixscript():
     r2 = m2.run("fixscript", Context(app_dir=app_dir), lambda m: None)
     assert not r2.ok
     print("[OK] 修复脚本: 全注释输出 3 命令映射 / 1 人工建议 / 信息级排除 / 未诊断拒绝")
+
+
+def test_report_export_contract():
+    """报告导出契约：模块经 report_export 自声明顶层字段，主程序不硬编码。"""
+    from modules import host_diagnostics as hd
+
+    # 默认实现不贡献字段
+    assert ModuleBase().report_export(ActionResult()) == {}
+
+    # folder_virus：v1.x 兼容字段由模块自己声明
+    fvm = fv.Module()
+    fake = ActionResult(report={"root": "E:\\x", "meta": {"a": 1},
+                                "items": [1], "hidden_items": [2], "other": 3})
+    exported = fvm.report_export(fake)
+    assert exported == {"root": "E:\\x", "meta": {"a": 1}, "items": [1], "hidden_items": [2]}, exported
+    assert "other" not in exported
+
+    # host_diagnostics：只读字段由模块自己声明；无 report 时给空列表
+    hdm = hd.Module()
+    assert hdm.report_export(ActionResult(report={"host_diagnostics_readonly": [1]})) == \
+        {"host_diagnostics_readonly": [1]}
+    assert hdm.report_export(ActionResult()) == {"host_diagnostics_readonly": []}
+
+    # 模拟主程序合并：仅这两个模块贡献顶层字段，其余模块必须返回空
+    instances, _errs = load_modules()
+    mods = {m.meta["id"]: m for m in instances}
+    data = {}
+    for mid, m in mods.items():
+        res = ActionResult(report={})
+        extra = m.report_export(res)
+        if mid == "folder_virus":
+            assert extra == {"root": None, "meta": None, "items": None, "hidden_items": None}, extra
+        elif mid == "host_diagnostics":
+            assert extra == {"host_diagnostics_readonly": []}, extra
+        else:
+            assert extra == {}, (mid, extra)
+        if isinstance(extra, dict):
+            data.update(extra)
+    print("[OK] 报告导出契约: 7 模块自声明字段 / 默认空 / app.py 无硬编码依赖")
 
 
 def test_gui_assembly():
@@ -626,6 +791,7 @@ if __name__ == "__main__":
     test_signature_db_empty_and_rules()
     test_clamav_bridge_parse_and_mock()
     test_clamav_log_not_contaminated()
+    test_clamav_partial_error()
     test_classic_trojans()
     test_signature_db_pack()
     test_modern_threats()

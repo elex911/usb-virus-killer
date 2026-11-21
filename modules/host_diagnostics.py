@@ -361,6 +361,11 @@ class Module(ModuleBase):
                row.get("value", ""), row.get("detail", ""))
         )
 
+    def report_export(self, result):
+        """v1.x 报告兼容字段（host_diagnostics_readonly）由本模块自己声明。"""
+        rep = result.report if isinstance(result.report, dict) else {}
+        return {"host_diagnostics_readonly": rep.get("host_diagnostics_readonly", [])}
+
     def run(self, action_id, ctx, log):
         if action_id == "fixscript":
             return self._fixscript(action_id, ctx, log)

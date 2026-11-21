@@ -34,6 +34,7 @@ from core.widgets import ResultTable
 # ---- 可注入接缝（测试用；生产直接走 winreg/系统调用） ----
 _reg_enum_values = None      # (hive_int, subkey) -> [(name, value, type)]
 _reg_get = None              # (hive_int, subkey, name) -> value or None
+_reg_get_ex = None           # (hive_int, subkey, name) -> (value, type) or None
 _reg_delete_value = None     # (hive_int, subkey, name) -> None
 _reg_set = None              # (hive_int, subkey, name, value, type) -> None
 _reg_enum_keys = None        # (hive_int, subkey) -> [subkey_name]
@@ -69,6 +70,20 @@ def _default_reg_get(hive, subkey, name):
     try:
         val, _typ = winreg.QueryValueEx(k, name)
         return val
+    except OSError:
+        return None
+    finally:
+        k.Close()
+
+
+def _default_reg_get_ex(hive, subkey, name):
+    """同 _reg_get，但连同值类型一起返回 (value, type)；键/值不存在返回 None。"""
+    try:
+        k = winreg.OpenKey(hive, subkey)
+    except OSError:
+        return None
+    try:
+        return winreg.QueryValueEx(k, name)
     except OSError:
         return None
     finally:
@@ -133,10 +148,11 @@ def _default_list_shares():
 
 
 def _reset_seams():
-    global _reg_enum_values, _reg_get, _reg_delete_value, _reg_set
+    global _reg_enum_values, _reg_get, _reg_get_ex, _reg_delete_value, _reg_set
     global _reg_enum_keys, _read_hosts, _list_shares
     _reg_enum_values = _default_reg_enum_values
     _reg_get = _default_reg_get
+    _reg_get_ex = _default_reg_get_ex
     _reg_delete_value = _default_reg_delete_value
     _reg_set = _default_reg_set
     _reg_enum_keys = _default_reg_enum_keys
@@ -277,7 +293,7 @@ class Module(ModuleBase):
 
         for hive_name, subkey in RUN_LOCATIONS:
             hive = HIVE_NAMES[hive_name]
-            for name, val, _typ in _reg_enum_values(hive, subkey):
+            for name, val, vtype in _reg_enum_values(hive, subkey):
                 level, reason, fixable = _classify_startup(name, val)
                 row = {
                     "kind": "启动项", "level": level,
@@ -289,11 +305,11 @@ class Module(ModuleBase):
                 if level == "高危":
                     fixables.append({
                         "kind": "启动项", "hive": hive_name, "subkey": subkey,
-                        "name": name, "old_value": val,
+                        "name": name, "old_value": val, "old_type": vtype,
                     })
 
-        val = _reg_get(HIVE_NAMES["HKCR"], TXTFILE_ASSOC, "")
-        assoc_val = "" if val is None else str(val)
+        got = _reg_get_ex(HIVE_NAMES["HKCR"], TXTFILE_ASSOC, "")
+        assoc_val = "" if got is None else str(got[0])
         assoc_norm = _norm(assoc_val).strip()
         known_ok = any(assoc_norm == _norm(t).strip() for t in TXT_DEFAULTS)
         if not assoc_val:
@@ -307,8 +323,9 @@ class Module(ModuleBase):
                          "value": assoc_val, "reason": "txtfile 被改向非记事本程序（QQ尾巴典型手法）"})
             fixables.append({
                 "kind": "文件关联", "hive": "HKCR", "subkey": TXTFILE_ASSOC,
-                "name": "", "old_value": assoc_val, "new_value": DEFAULT_TXT_VALUE,
-                "new_type": DEFAULT_TXT_TYPE,
+                "name": "", "old_value": assoc_val,
+                "old_type": got[1] if got else winreg.REG_SZ,
+                "new_value": DEFAULT_TXT_VALUE, "new_type": DEFAULT_TXT_TYPE,
             })
 
         try:
@@ -316,7 +333,8 @@ class Module(ModuleBase):
         except Exception:
             subkeys = []
         for sk in subkeys:
-            dbg = _reg_get(HIVE_NAMES["HKLM"], IFEOSUB + "\\" + sk, "Debugger")
+            got = _reg_get_ex(HIVE_NAMES["HKLM"], IFEOSUB + "\\" + sk, "Debugger")
+            dbg = got[0] if got else None
             if dbg:
                 rows.append({
                     "kind": "IFEO劫持", "level": "高危",
@@ -327,6 +345,7 @@ class Module(ModuleBase):
                 fixables.append({
                     "kind": "IFEO劫持", "hive": "HKLM",
                     "subkey": IFEOSUB + "\\" + sk, "name": "Debugger", "old_value": dbg,
+                    "old_type": got[1],
                 })
 
         homepage = _reg_get(HIVE_NAMES["HKCU"],
@@ -394,11 +413,18 @@ class Module(ModuleBase):
         rows, fixables = self.collect(log)
         if not fixables:
             return None, "没有需要修复的高危项。"
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         bdir = os.path.join(self._backup_dir(ctx), stamp)
         os.makedirs(bdir, exist_ok=True)
         manifest = {"time": datetime.now().isoformat(), "items": [], "applied": []}
+        mf_path = os.path.join(bdir, "manifest.json")
 
+        def _flush():
+            # 每改一项就重写 manifest：中途异常时，已修改的项仍然可回滚
+            with open(mf_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        _flush()
         for item in fixables:
             hive = HIVE_NAMES[item["hive"]]
             subkey, name = item["subkey"], item["name"]
@@ -409,10 +435,9 @@ class Module(ModuleBase):
                 _reg_delete_value(hive, subkey, name)
                 manifest["applied"].append({**item, "action": "delete_value"})
             manifest["items"].append(item)
+            _flush()
             log("已修复：%s\\%s [%s]" % (item["hive"], subkey, name or "(默认)"))
 
-        with open(os.path.join(bdir, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
         return bdir, "已修复 %d 项高危；备份：%s" % (len(fixables), bdir)
 
     def _do_rollback(self, ctx, log):
@@ -430,12 +455,13 @@ class Module(ModuleBase):
         restored = 0
         for item in manifest.get("applied", []):
             hive = HIVE_NAMES[item["hive"]]
-            if item["action"] == "delete_value":
-                _reg_set(hive, item["subkey"], item["name"],
-                         item["old_value"], winreg.REG_SZ)
-            elif item["action"] == "set_assoc":
-                _reg_set(hive, item["subkey"], item["name"],
-                         item["old_value"], winreg.REG_SZ)
+            # 按备份记录的原类型还原（旧备份无 old_type 时退回 REG_SZ 兼容）
+            old_type = item.get("old_type", winreg.REG_SZ)
+            old_value = item["old_value"]
+            if old_type == winreg.REG_BINARY and isinstance(old_value, list):
+                old_value = bytes(old_value)  # JSON 往返把 bytes 变成了 list
+            if item["action"] in ("delete_value", "set_assoc"):
+                _reg_set(hive, item["subkey"], item["name"], old_value, old_type)
             restored += 1
             log("已回滚：%s\\%s [%s]" % (item["hive"], item["subkey"], item["name"] or "(默认)"))
         return "已回滚 %d 项（备份 %s）。" % (restored, latest), restored

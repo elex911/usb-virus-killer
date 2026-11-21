@@ -21,7 +21,7 @@ class Action:
     id: str
     label: str
     confirm: Optional[str] = None          # 执行前确认文本；None 表示不确认
-    target_mode: str = "required"          # required=必须有目标；optional=可用可不用；none=不需要目标
+    target_mode: str = "required"          # required=必须有目标；none=不需要目标
     danger: bool = False                   # 仅用于界面着色提示，不控制权限
     order: int = 100
     prompt: str = ""                       # "directory"：先选目录；"file"：先选文件（主线程完成）
@@ -52,7 +52,6 @@ class Context:
     app_dir: str = ""
     pick: str = ""                         # 由 Action.prompt=directory 预选的目录
     settings: Dict[str, Any] = field(default_factory=dict)
-    ask_directory: Optional[Callable[..., Optional[str]]] = None
 
 
 class ModuleBase:
@@ -94,3 +93,11 @@ class ModuleBase:
     def detail(self, row: Dict[str, Any]) -> str:
         """表格双击详情文本。"""
         return "\n".join("%s：%s" % (k, v) for k, v in row.items())
+
+    def report_export(self, result: "ActionResult") -> Dict[str, Any]:
+        """导出 JSON 报告时本模块贡献的顶层字段；默认不贡献任何字段。
+
+        需要保持 v1.x 报告兼容的模块覆写本方法（如 folder_virus 的
+        root/meta/items/hidden_items）。主程序不认识具体字段名。
+        """
+        return {}

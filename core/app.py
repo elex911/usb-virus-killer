@@ -34,7 +34,6 @@ class App:
             self.module_by_id[m.meta.get("id")] = m
 
         self.ctx = Context(app_dir=app_dir())
-        self.ctx.ask_directory = self._ask_directory
         self.q = queue.Queue()
         self.views = {}
         self.results = {}
@@ -134,16 +133,15 @@ class App:
             foreground="#888",
         ).pack(anchor="w")
 
-    def _ask_directory(self, title="选择目录"):
-        return filedialog.askdirectory(title=title)
-
     def _refresh_drives(self):
         targets = []
         seen = set()
         for mod in self.modules:
             try:
                 suggested = mod.suggest_targets() or []
-            except Exception:
+            except Exception as exc:
+                # 静默吞掉会让"为什么下拉框是空的"无法诊断，记录后继续
+                self._log("[盘符] %s 候选获取失败：%s" % (mod.meta.get("id"), exc))
                 continue
             for item in suggested:
                 # 多个模块都会给出同一批盘符，按规范化文本去重，避免下拉框重复项
@@ -156,7 +154,8 @@ class App:
         for mod in self.modules:
             try:
                 h = mod.target_hint(len(targets))
-            except Exception:
+            except Exception as exc:
+                self._log("[盘符] %s 提示获取失败：%s" % (mod.meta.get("id"), exc))
                 continue
             if h and h not in hints:
                 hints.append(h)
@@ -282,7 +281,11 @@ class App:
                         "result": res,
                     }
                     if res.message and res.show_dialog:
-                        messagebox.showinfo(res.title or (mod.meta.get("name", mid) if mod else "提示"), res.message)
+                        title = res.title or (mod.meta.get("name", mid) if mod else "提示")
+                        if res.ok:
+                            messagebox.showinfo(title, res.message)
+                        else:
+                            messagebox.showwarning(title, res.message)
                     elif res.message and not res.ok:
                         messagebox.showwarning(mod.meta.get("name", mid) if mod else "提示", res.message)
                     short = res.message.splitlines()[0] if res.message else "完成"
@@ -290,7 +293,14 @@ class App:
                     self._set_busy(False)
         except queue.Empty:
             pass
-        self.root.after(120, self._poll)
+        except Exception:
+            # 任何未预期异常都不能断掉轮询链（否则界面假死），记录后继续调度
+            try:
+                self._log("[内部] 轮询处理异常：\n" + traceback.format_exc())
+            except Exception:
+                pass
+        finally:
+            self.root.after(120, self._poll)
 
     # ---------- 报告 ----------
     def _export(self):
@@ -315,6 +325,8 @@ class App:
             ],
             "module_results": {},
         }
+        # 各模块经契约钩子自行声明要提升到报告顶层的字段（如 v1.x 兼容字段）；
+        # 主程序不认识具体字段名
         for mid, rec in self.results.items():
             res = rec["result"]
             data["module_results"][mid] = {
@@ -324,16 +336,17 @@ class App:
                 "ok": res.ok,
                 "report": res.report if res.report is not None else res.data,
             }
+            mod = self.module_by_id.get(mid)
+            if mod is None:
+                continue
+            try:
+                extra = mod.report_export(res)
+            except Exception as exc:
+                self._log("[报告导出] %s：%s" % (mid, exc))
+                continue
+            if isinstance(extra, dict):
+                data.update(extra)
 
-        # 兼容 v1.x 报告字段名
-        fv = self.results.get("folder_virus")
-        if fv and fv["result"].report:
-            rep = fv["result"].report
-            for key in ("root", "meta", "items", "hidden_items"):
-                data[key] = rep.get(key)
-        hd = self.results.get("host_diagnostics")
-        if hd and hd["result"].report:
-            data["host_diagnostics_readonly"] = hd["result"].report.get("host_diagnostics_readonly", [])
         data["caution"] = (
             "主机诊断字段为只读疑点登记（高危/关注/信息），非病毒确认，未做任何修改。"
         )

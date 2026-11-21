@@ -411,6 +411,11 @@ class Module(ModuleBase):
             "hidden_items": list(eng.hidden_items),
         }
 
+    def report_export(self, result):
+        """v1.x 报告兼容字段（root/meta/items/hidden_items）由本模块自己声明。"""
+        rep = result.report if isinstance(result.report, dict) else {}
+        return {k: rep.get(k) for k in ("root", "meta", "items", "hidden_items")}
+
     def run(self, action_id, ctx, log):
         if action_id == "restore":
             qdir = ctx.pick
