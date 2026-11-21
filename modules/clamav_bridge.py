@@ -141,6 +141,52 @@ def parse_found(output):
     return rows
 
 
+DB_LINE_RE = re.compile(
+    r"([a-z0-9_.]+\.c[vd]l?d?)\s+(?:database\s+)?(updated|is up-to-date)",
+    re.I,
+)
+DB_VERSION_RE = re.compile(r"version:\s*(\d+)", re.I)
+ERROR_LINE_RE = re.compile(r"^(error|warning)\b|failed|can't|cannot", re.I)
+
+
+def summarize_freshclam(rc, text):
+    """把 freshclam 英文输出压成中文结论；失败时保留原始末段便于排查。"""
+    updated, current, errors = [], [], []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = DB_LINE_RE.search(line)
+        if m:
+            name = m.group(1).lower()
+            state = m.group(2).lower()
+            ver = DB_VERSION_RE.search(line)
+            ver = ver.group(1) if ver else ""
+            item = "%s %s" % (name, ver) if ver else name
+            (updated if state == "updated" else current).append(item)
+            continue
+        if ERROR_LINE_RE.search(line):
+            errors.append(line)
+
+    if rc == 0:
+        if updated:
+            head = "特征库已更新：%s。" % "、".join(updated)
+        else:
+            head = "特征库已是最新，无需更新。"
+        if current:
+            head += "\n当前版本：%s。" % "、".join(current)
+        if errors:
+            head += "\n提示：%s" % errors[-1][:200]
+        return head
+
+    reason = errors[-1] if errors else "（无错误行输出）"
+    tail = (text or "").strip()
+    msg = "特征库更新失败（返回码 %d）。\n原因：%s" % (rc, reason[:300])
+    if tail:
+        msg += "\n\n原始输出末段：\n%s" % tail[-1200:]
+    return msg
+
+
 class Module(ModuleBase):
     meta = {
         "id": "clamav_bridge",
@@ -253,11 +299,11 @@ class Module(ModuleBase):
             rc, out, err = _run_process([fresh_exe], TIMEOUT_UPDATE)
             text = ((out or "") + "\n" + (err or "")).strip()
             ok = rc == 0
-            msg = "freshclam 返回码：%d\n\n%s" % (rc, text[-2000:] or "(无输出)")
+            msg = summarize_freshclam(rc, text)
             return ActionResult(
                 action=action_id, ok=ok, message=msg, title="更新ClamAV库",
-                show_dialog=ok, report={"freshclam": fresh_exe, "returncode": rc,
-                                        "output_tail": text[-4000:]},
+                show_dialog=True, report={"freshclam": fresh_exe, "returncode": rc,
+                                           "output_tail": text[-4000:]},
             )
 
         if action_id == "scan":
@@ -280,6 +326,12 @@ class Module(ModuleBase):
             version = _version(exe)
             arch = _pe_arch(exe)
             log_file = os.path.join(ctx.app_dir or os.getcwd(), "clamav_last_scan.log")
+            # clamscan --log 为追加写：残留旧结果会污染本次命中统计，先清空
+            try:
+                if os.path.isfile(log_file):
+                    os.remove(log_file)
+            except Exception as exc:
+                log("清理旧扫描日志失败：%s" % exc)
             cmd = [exe, "--recursive", "--log=" + log_file, ctx.target]
             log("调用外部引擎扫描：%s" % exe)
             rc, out, err = _run_process(cmd, TIMEOUT_SCAN)

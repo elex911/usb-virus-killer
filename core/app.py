@@ -139,18 +139,27 @@ class App:
 
     def _refresh_drives(self):
         targets = []
+        seen = set()
+        for mod in self.modules:
+            try:
+                suggested = mod.suggest_targets() or []
+            except Exception:
+                continue
+            for item in suggested:
+                # 多个模块都会给出同一批盘符，按规范化文本去重，避免下拉框重复项
+                key = " ".join(str(item).split()).lower()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                targets.append(item)
         hints = []
         for mod in self.modules:
             try:
-                targets.extend(mod.suggest_targets() or [])
-            except Exception:
-                pass
-            try:
                 h = mod.target_hint(len(targets))
-                if h:
-                    hints.append(h)
             except Exception:
-                pass
+                continue
+            if h and h not in hints:
+                hints.append(h)
         self.cb["values"] = targets
         if targets and not self.target.get():
             self.target.set(targets[0].split()[0])

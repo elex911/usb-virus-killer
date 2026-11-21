@@ -289,6 +289,60 @@ def test_modern_threats():
           % len(real.data["rows"]))
 
 
+def test_clamav_log_not_contaminated():
+    """clamscan --log 是追加写：上次扫描的命中不得混入本次统计（回归）。"""
+    tmp = tempfile.mkdtemp(prefix="fk_clam_log_", dir=ROOT)
+    try:
+        log_file = os.path.join(tmp, "clamav_last_scan.log")
+        with open(log_file, "w", encoding="utf-8") as f:
+            f.write("D:\\old\\eicar.com: Eicar-Test-Signature FOUND\n"
+                    "----------- SCAN SUMMARY -----------\nInfected files: 1\n")
+
+        original = cb._run_process
+        cb._run_process = lambda cmd, timeout: (0, "", "")  # 本次扫描无输出无命中
+        try:
+            ctx = Context(app_dir=tmp)
+            ctx.target = tmp
+            ctx.is_drive = False
+            res = cb.Module().run("scan", ctx, lambda m: None)
+            assert res.report["infected"] == 0, res.report
+            assert res.report["summary_infected"] == 0, res.report
+            assert not os.path.exists(log_file) or "FOUND" not in open(
+                log_file, encoding="utf-8", errors="replace").read(), "旧日志未清理"
+            print("[OK] ClamAV 日志隔离: 旧扫描命中不再污染本次统计")
+        finally:
+            cb._run_process = original
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_freshclam_summary():
+    """更新结果必须给中文结论，不把原始英文输出与返回码糊到弹窗里。"""
+    upstream = (
+        "ClamAV update process started at Sat Nov 21 10:24:46 2026\n"
+        "daily.cvd database is up-to-date (version: 28189, sigs: 355874, f-level: 90)\n"
+        "main.cvd database is up-to-date (version: 63, sigs: 3287027, f-level: 90)\n"
+        "bytecode.cvd database is up-to-date (version: 339, sigs: 80, f-level: 90)"
+    )
+    updated = (
+        "ClamAV update process started at Sat Nov 21 10:30:00 2026\n"
+        "daily.cvd updated (version: 28190, sigs: 355900, f-level: 90)"
+    )
+    failed = (
+        "ClamAV update process started at Sat Nov 21 10:31:00 2026\n"
+        "ERROR: Can't download daily.cvd from database.clamav.net"
+    )
+    up = cb.summarize_freshclam(0, upstream)
+    new = cb.summarize_freshclam(0, updated)
+    bad = cb.summarize_freshclam(1, failed)
+
+    assert "返回码" not in up and "返回码" not in new, (up, new)
+    assert "已是最新" in up and "28189" in up and "63" in up, up
+    assert "已更新" in new and "daily.cvd 28190" in new, new
+    assert "更新失败" in bad and "Can't download" in bad, bad
+    print("[OK] freshclam 摘要: 最新 / 已更新 / 失败 三种输出均中文结论")
+
+
 def test_gui_assembly():
     import tkinter as tk
     from core.app import App
@@ -311,8 +365,16 @@ def test_gui_assembly():
 
         walk(root)
         assert any("军不见" in t and "180******66" in t for t in texts), "界面未找到作者信息"
-        print("[OK] GUI 装配: %d 视图 / %d 按钮；作者信息已显示"
-              % (len(app.views), len(app.all_buttons)))
+
+        # 多个模块都提供同一批盘符：下拉框不得出现重复项，提示不得重复叠加
+        values = [str(v) for v in app.cb["values"]]
+        drives = fv.list_drives()
+        assert len(values) == len(dict.fromkeys(values)) == len(drives), values
+        hint = app.info.cget("text")
+        assert hint.count("共 ") == 1 and "；共" not in hint, hint
+        assert ("共 %d 个可处理盘符。" % len(drives)) in hint, hint
+        print("[OK] GUI 装配: %d 视图 / %d 按钮；作者信息已显示；盘符 %d 项无重复，提示单一"
+              % (len(app.views), len(app.all_buttons), len(values)))
     finally:
         root.destroy()
 
@@ -324,6 +386,8 @@ if __name__ == "__main__":
     test_host_diagnostics()
     test_signature_db_empty_and_rules()
     test_clamav_bridge_parse_and_mock()
+    test_clamav_log_not_contaminated()
     test_modern_threats()
+    test_freshclam_summary()
     test_gui_assembly()
     print("ALL PASS")
