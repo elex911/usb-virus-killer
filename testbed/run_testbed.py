@@ -255,7 +255,7 @@ def s_hostdiag(log):
     return ok, checks, None
 
 
-@case("13 经典木马体检（真实主机低噪音）")
+@case("12 经典木马体检（真实主机低噪音）")
 def s_classic(log):
     ct._reset_seams()
     res = ct.Module().run("detect", Context(), log)
@@ -272,7 +272,7 @@ def s_classic(log):
     return ok, checks, None
 
 
-@case("14 特征库规则包全链路")
+@case("13 特征库规则包全链路")
 def s_sigpack(log):
     tmp = tempfile.mkdtemp(prefix="tb_pack_", dir=RESULTS_DIR)
     try:
@@ -304,7 +304,7 @@ def s_sigpack(log):
         return ok, checks, tmp
     finally:
         pass
-@case("15 GUI 装配烟测（源码级）")
+@case("14 GUI 装配烟测（源码级）")
 def s_gui(log):
     import tkinter as tk
     from core.app import App
@@ -341,7 +341,7 @@ def s_gui(log):
         root.destroy()
 
 
-@case("16 AMSI 脚本扫描（接缝注入 + 降级）")
+@case("15 AMSI 脚本扫描（接缝注入 + 降级）")
 def s_amsi(log):
     from modules import amsi_scan as am
     tmp = tempfile.mkdtemp(prefix="tb_amsi_", dir=RESULTS_DIR)
@@ -372,7 +372,7 @@ def s_amsi(log):
         am._reset_seams()
 
 
-@case("17 修复脚本导出 + 误报候选登记")
+@case("16 修复脚本导出 + 误报候选登记")
 def s_fixscript_fp(log):
     tmp = tempfile.mkdtemp(prefix="tb_fx_", dir=RESULTS_DIR)
     rows = [

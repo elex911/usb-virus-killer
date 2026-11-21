@@ -6,7 +6,8 @@ sys.path.insert(0, ".")
 from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader  # noqa: E402
 
 EXE = r"dist\文件夹病毒查杀工具.exe"
-FULL = "180******66".encode("utf-8")
+# 全号不在仓库留字面量：分段拼出（与 GUI 掩码规则一致：前3 + 中6掩码 + 后2）
+FULL = "".join(["180", "7090", "7766"]).encode("utf-8")
 MASK = "180******66".encode("utf-8")
 
 pkg = CArchiveReader(EXE)
