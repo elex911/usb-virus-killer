@@ -1,0 +1,67 @@
+# -*- coding: utf-8 -*-
+"""
+模块模板
+--------
+用法：复制本文件为 plugins/MyModule.py（文件名不要以下划线开头），重启程序即可。
+主程序会自动发现本文件中的 Module 类，生成按钮和标签页，无需修改任何核心代码。
+
+可用能力：
+  - meta: 模块身份与排序
+  - actions(): 定义按钮；target_mode 可选 required / optional / none
+  - prepare_context(): 解析目标路径（仅 required 时调用）
+  - build_view(): 返回一个 tkinter 控件作为标签页
+  - render(): 在主线程刷新标签页
+  - run(): 在后台线程执行具体工作
+  - detail(): 双击表格行的详情文本
+"""
+from core.api import Action, ActionResult, ModuleBase
+from core.widgets import ResultTable
+
+
+class Module(ModuleBase):
+    meta = {
+        "id": "my_module",              # 必须唯一；重名模块会被跳过
+        "name": "我的模块",
+        "version": "1.0",
+        "description": "在这里写这个模块做什么。",
+        "order": 90,                    # 数字越小越靠前
+    }
+
+    def actions(self):
+        return [
+            Action(
+                id="hello",
+                label="示例扫描",
+                confirm=None,           # 需要二次确认时写提示文本
+                target_mode="none",     # 不需要目标盘符/目录
+                order=10,
+            ),
+        ]
+
+    def build_view(self, parent, ctx):
+        return ResultTable(
+            parent,
+            columns=[("name", "名称", 200), ("value", "值", 400)],
+            tag_key="name",
+            tag_map={"示例": "#2c7"},
+            on_detail=self.detail,
+        )
+
+    def render(self, action_id, result, view, ctx):
+        view.set_rows(result.data.get("rows", []))
+
+    def detail(self, row):
+        return "名称：%s\n值：%s" % (row.get("name", ""), row.get("value", ""))
+
+    def run(self, action_id, ctx, log):
+        log("示例模块开始运行。")
+        rows = [{"name": "示例", "value": "把这里换成你的检测逻辑"}]
+        return ActionResult(
+            action=action_id,
+            ok=True,
+            message="示例模块执行完成。",
+            title="示例模块",
+            show_dialog=True,
+            data={"rows": rows},
+            report={"my_module_rows": rows},   # 会被写入导出报告
+        )

@@ -1,0 +1,5 @@
+{
+  "schema_version": "1.0",
+  "_readme": "特征库命中 ≠ 病毒确认；本模块只报告，不隔离、不删除。只有带可核 source、T1/T2 证据且显式 enabled=true 的规则才参与扫描。",
+  "rules": []
+}

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Build and packaged output
+build/
+dist/
+*.spec.bak
+
+# Backup and temporary files
+.backup-*/
+*.bak
+*.tmp
+
+# Local runtime state
+*.log
+signature_db.local.json
+
+# Editor and OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Keep plugin templates tracked
+!plugins/**/*.py.template
