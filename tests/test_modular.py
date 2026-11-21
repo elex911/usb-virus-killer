@@ -465,6 +465,123 @@ def test_freshclam_summary():
     print("[OK] freshclam 摘要: 最新 / 已更新 / 失败 三种输出均中文结论")
 
 
+def test_amsi_scan():
+    """AMSI 模块：不可用时优雅降级；注入 provider 分级判定；隔离目录与非脚本跳过。"""
+    from modules import amsi_scan as am
+    am._reset_seams()
+    mod = am.Module()
+
+    tmp = tempfile.mkdtemp(prefix="fk_amsi_a_", dir=ROOT)
+    with open(os.path.join(tmp, "a.ps1"), "w", encoding="utf-8") as f:
+        f.write("Write-Host hello\n")
+    ctx = Context(app_dir=tempfile.mkdtemp(prefix="fk_amsi_b_", dir=ROOT))
+    ctx.target = tmp
+    am._load_amsi = lambda: None
+    res = mod.run("scan", ctx, lambda m: None)
+    assert res.ok and res.report["amsi"]["available"] is False
+    assert "跳过" in res.message
+
+    am._reset_seams()
+
+    def fake_scan(api, data, name):
+        if name.endswith(".vbs"):
+            return (0, 1)
+        if name.endswith(".js"):
+            return (0, 2000)
+        return (0, 0)
+
+    am._amsi_scan = fake_scan
+    tmp2 = tempfile.mkdtemp(prefix="fk_amsi_c_", dir=ROOT)
+    with open(os.path.join(tmp2, "evil.vbs"), "w") as f:
+        f.write("x=1\n")
+    with open(os.path.join(tmp2, "sus.js"), "w") as f:
+        f.write("y=2\n")
+    with open(os.path.join(tmp2, "note.txt"), "w") as f:
+        f.write("z=3\n")
+    os.makedirs(os.path.join(tmp2, "sub__WORM_QUARANTINE_x"))
+    with open(os.path.join(tmp2, "sub__WORM_QUARANTINE_x", "q.vbs"), "w") as f:
+        f.write("skip\n")
+    ctx2 = Context(); ctx2.target = tmp2
+    res2 = mod.run("scan", ctx2, lambda m: None)
+    rows = res2.data["rows"]
+    hi = [r for r in rows if r["level"] == "高危"]
+    wa = [r for r in rows if r["level"] == "关注"]
+    assert len(hi) == 1 and hi[0]["path"].endswith("evil.vbs"), hi
+    assert len(wa) == 1 and wa[0]["path"].endswith("sus.js"), wa
+    assert not any("q.vbs" in r["path"] or "note.txt" in r["path"] for r in rows)
+    assert res2.report["amsi"]["detected"] == 1 and res2.report["amsi"]["suspicious"] == 1
+    print("[OK] AMSI 扫描: 降级跳过 + 注入检出 高危1/关注1，隔离目录与非脚本不扫")
+
+
+def test_fp_feedback():
+    """误报候选登记：报告解析 / 去重 / 查看 / 校验提示。"""
+    from modules import signature_db as sig
+    app_dir = tempfile.mkdtemp(prefix="fk_fp_", dir=ROOT)
+    matches = [
+        {"id": "R1", "type": "filename_regex", "level": "命中",
+         "path": "C:/x/evil.exe", "value": "evil.*",
+         "source": "T1来源", "evidence": "T1", "first_seen": "2026-01-01"},
+    ]
+    exported = {"module_results": {"signature_db": {
+        "module": "本地特征库", "action": "scan",
+        "report": {"matches": matches, "matched": 1}}}}
+    rf = os.path.join(app_dir, "report.json")
+    with open(rf, "w", encoding="utf-8") as f:
+        json.dump(exported, f, ensure_ascii=False)
+    ctx = Context(app_dir=app_dir)
+    ctx.pick = rf
+    mod = sig.Module()
+    r1 = mod.run("fp_mark", ctx, lambda m: None)
+    assert r1.ok and r1.report["logged"] == 1, r1.report
+    r2 = mod.run("fp_mark", ctx, lambda m: None)
+    assert r2.ok and r2.report["logged"] == 0 and r2.report["duplicates"] == 1
+    r3 = mod.run("fp_view", ctx, lambda m: None)
+    assert r3.report["pending"] == 1
+    empty = os.path.join(app_dir, "empty.json")
+    with open(empty, "w", encoding="utf-8") as f:
+        json.dump({"module_results": {}}, f)
+    ctx2 = Context(app_dir=app_dir)
+    ctx2.pick = empty
+    r4 = mod.run("fp_mark", ctx2, lambda m: None)
+    assert not r4.ok and "没有找到" in r4.message
+    print("[OK] 误报反馈: 登记1条 / 重复去重 / 查看 / 空报告拒绝")
+
+
+def test_fixscript():
+    """修复脚本导出：默认全注释、命令映射正确、信息级排除、未诊断拒绝。"""
+    from modules import host_diagnostics as hd
+    app_dir = tempfile.mkdtemp(prefix="fk_fx_", dir=ROOT)
+    rows = [
+        {"kind": "自启动", "level": "高危",
+         "path": r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\KV2004",
+         "value": "microsoft.exe", "detail": "QQ 尾巴"},
+        {"kind": "IFEO", "level": "高危",
+         "path": r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe\Debugger",
+         "value": r"C:\tmp\evil.exe", "detail": "映像劫持"},
+        {"kind": "Winlogon", "level": "关注",
+         "path": r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell",
+         "value": "explorer.exe x.exe", "detail": "Shell 异常"},
+        {"kind": "自启动", "level": "信息",
+         "path": r"HKCU\...\Run\Good", "value": "good.exe", "detail": "常规"},
+    ]
+    mod = hd.Module()
+    mod._last_rows = rows
+    mod._last_time = "2026-11-21T12:00:00"
+    r1 = mod.run("fixscript", Context(app_dir=app_dir), lambda m: None)
+    assert r1.ok and r1.report["written"] == 1, r1.report
+    raw = open(r1.report["fixscript"], "rb").read().decode("utf-8-sig")
+    uncommented = [l for l in raw.splitlines()
+                   if l.strip() and not l.strip().startswith("#")]
+    assert not uncommented, uncommented
+    assert "-Name 'KV2004'" in raw and "-Name 'Debugger'" in raw
+    assert "误改可能导致系统无法启动" in raw
+    assert "Good" not in raw
+    m2 = hd.Module()
+    r2 = m2.run("fixscript", Context(app_dir=app_dir), lambda m: None)
+    assert not r2.ok
+    print("[OK] 修复脚本: 全注释输出 3 命令映射 / 1 人工建议 / 信息级排除 / 未诊断拒绝")
+
+
 def test_gui_assembly():
     import tkinter as tk
     from core.app import App
@@ -513,5 +630,8 @@ if __name__ == "__main__":
     test_signature_db_pack()
     test_modern_threats()
     test_freshclam_summary()
+    test_amsi_scan()
+    test_fp_feedback()
+    test_fixscript()
     test_gui_assembly()
     print("ALL PASS")

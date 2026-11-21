@@ -333,12 +333,87 @@ def s_gui(log):
             "combobox_count_matches_drives": len(values) == len(drives),
             "hint": hint,
         }
-        ok = (len(app.views) == 6 and author_ok
+        ok = (len(app.views) == 7 and author_ok
               and len(values) == len(set(values)) == len(drives)
               and hint.count("；") == 0)
         return ok, checks, None
     finally:
         root.destroy()
+
+
+@case("16 AMSI 脚本扫描（接缝注入 + 降级）")
+def s_amsi(log):
+    from modules import amsi_scan as am
+    tmp = tempfile.mkdtemp(prefix="tb_amsi_", dir=RESULTS_DIR)
+    am._reset_seams()
+    try:
+        with open(os.path.join(tmp, "evil.vbs"), "w") as f:
+            f.write("x=1\n")
+        with open(os.path.join(tmp, "note.txt"), "w") as f:
+            f.write("z=3\n")
+
+        am._load_amsi = lambda: None
+        ctx0 = Context(); ctx0.target = tmp
+        r0 = am.Module().run("scan", ctx0, log)
+        degraded = r0.ok and r0.report["amsi"]["available"] is False
+
+        am._reset_seams()
+        am._amsi_scan = lambda api, data, name: (0, 1) if name.endswith(".vbs") else (0, 0)
+        ctx = Context(); ctx.target = tmp
+        r1 = am.Module().run("scan", ctx, log)
+        hi = [r for r in r1.data["rows"] if r["level"] == "高危"]
+        checks = {"degraded_ok": degraded, "detected": r1.report["amsi"]["detected"],
+                  "high_rows": len(hi), "txt_not_scanned": not any(
+                      "note.txt" in r["path"] for r in r1.data["rows"])}
+        ok = degraded and checks["detected"] == 1 and checks["high_rows"] == 1 \
+            and checks["txt_not_scanned"]
+        return ok, checks, tmp
+    finally:
+        am._reset_seams()
+
+
+@case("17 修复脚本导出 + 误报候选登记")
+def s_fixscript_fp(log):
+    tmp = tempfile.mkdtemp(prefix="tb_fx_", dir=RESULTS_DIR)
+    rows = [
+        {"kind": "自启动", "level": "高危",
+         "path": r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run\KV2004",
+         "value": "microsoft.exe", "detail": "QQ 尾巴特征"},
+        {"kind": "Winlogon", "level": "关注",
+         "path": r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Shell",
+         "value": "explorer.exe x.exe", "detail": "Shell 异常"},
+    ]
+    mod = hd.Module()
+    mod._last_rows = rows
+    mod._last_time = time.strftime("%Y-%m-%dT%H:%M:%S")
+    r1 = mod.run("fixscript", Context(app_dir=tmp), log)
+    script_ok = False
+    if r1.ok and r1.report.get("written"):
+        raw = io.open(r1.report["fixscript"], "rb").read().decode("utf-8-sig")
+        script_ok = not [l for l in raw.splitlines()
+                         if l.strip() and not l.strip().startswith("#")]
+    matches = [{"id": "R1", "type": "filename_regex", "level": "命中",
+                "path": "C:/x/evil.exe", "value": "evil.*",
+                "source": "T1来源", "evidence": "T1", "first_seen": "2026-01-01"}]
+    exported = {"module_results": {"signature_db": {
+        "module": "本地特征库", "action": "scan",
+        "report": {"matches": matches, "matched": 1}}}}
+    rf = os.path.join(tmp, "report.json")
+    io.open(rf, "w", encoding="utf-8").write(json.dumps(exported, ensure_ascii=False))
+    smod = sig.Module()
+    ctx = Context(app_dir=tmp); ctx.pick = rf
+    r2 = smod.run("fp_mark", ctx, log)
+    r3 = smod.run("fp_mark", ctx, log)
+    r4 = smod.run("fp_view", Context(app_dir=tmp), log)
+    checks = {
+        "script_all_commented": script_ok,
+        "fp_logged": r2.report.get("logged"),
+        "fp_dedup": r3.report.get("logged") == 0,
+        "fp_pending": r4.report.get("pending"),
+    }
+    ok = script_ok and checks["fp_logged"] == 1 and checks["fp_dedup"] \
+        and checks["fp_pending"] == 1
+    return ok, checks, tmp
 
 
 # ---------------- 执行器 ----------------

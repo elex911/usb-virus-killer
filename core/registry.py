@@ -23,6 +23,7 @@ BUILTIN_MODULES = (
     "modules.signature_db",
     "modules.clamav_bridge",
     "modules.modern_threats",
+    "modules.amsi_scan",
 )
 
 

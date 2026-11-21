@@ -44,6 +44,71 @@ EMPTY_DB = {
 BACKUP_DIRNAME = "signature_db_backups"
 MAX_BACKUPS = 10
 
+FP_FILENAME = "fp_feedback.jsonl"          # 误报候选记录（Avira 误报申诉思路的本地化）
+
+
+def fp_path(ctx):
+    return os.path.join(ctx.app_dir or os.getcwd(), FP_FILENAME)
+
+
+def read_fp(path):
+    """读取误报候选记录；返回 list[dict]，文件不存在返回空列表。"""
+    if not os.path.isfile(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(item, dict):
+                out.append(item)
+    return out
+
+
+def append_fp(path, entries):
+    """追加误报候选；返回实际新增条数（按 (rule_id, path) 去重）。"""
+    existing = {(e.get("rule_id"), e.get("path")) for e in read_fp(path)}
+    added = 0
+    if entries:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for e in entries:
+                key = (e.get("rule_id"), e.get("path"))
+                if key in existing:
+                    continue
+                f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                existing.add(key)
+                added += 1
+    return added
+
+
+def extract_matches_from_report(data):
+    """从导出的报告 JSON 里抽取特征库命中列表。
+
+    兼容两种结构：
+      1. 主程序「导出报告」：module_results.signature_db.report.matches
+      2. 直接是 scan 的 report：顶层 matches
+    """
+    if not isinstance(data, dict):
+        return []
+    mods = data.get("module_results")
+    if isinstance(mods, dict):
+        rec = mods.get("signature_db") or {}
+        rep = rec.get("report") if isinstance(rec, dict) else {}
+        matches = rep.get("matches") if isinstance(rep, dict) else None
+        if isinstance(matches, list):
+            return [m for m in matches if isinstance(m, dict)]
+    if isinstance(data.get("matches"), list):
+        return [m for m in data["matches"] if isinstance(m, dict)]
+    return []
+
 
 def db_path(ctx):
     custom = (ctx.settings or {}).get("signature_db_path")
@@ -280,6 +345,13 @@ class Module(ModuleBase):
                            "导入前自动备份当前库，可回滚。继续？",
                    order=40),
             Action("rollback_db", "回滚上次导入", target_mode="none", order=50),
+            Action("fp_mark", "登记误报候选", target_mode="none", prompt="file",
+                   prompt_title="选择包含特征库命中的导出报告 JSON",
+                   confirm="将把所选报告里的特征库命中登记为「误报候选」写入本地\n"
+                           "fp_feedback.jsonl，供规则复核时参考。\n"
+                           "本操作不会自动修改/删除任何规则，继续？",
+                   order=60),
+            Action("fp_view", "查看误报记录", target_mode="none", order=70),
         ]
 
     def prepare_context(self, ctx, raw_target, allow_fixed=False):
@@ -362,15 +434,42 @@ class Module(ModuleBase):
                 report={"db_path": path, "created": created, "rules": 0},
             )
 
+        if action_id == "fp_mark":
+            return self._fp_mark(action_id, ctx, log)
+
+        if action_id == "fp_view":
+            fpath = fp_path(ctx)
+            entries = read_fp(fpath)
+            rows = [{
+                "id": e.get("rule_id", "-"), "type": "-",
+                "level": "待核", "path": e.get("path", ""),
+                "value": "规则值：%s | 登记时间：%s"
+                         % (str(e.get("value", ""))[:80], e.get("time", "")),
+            } for e in entries] or [{
+                "id": "-", "type": "-", "level": "信息",
+                "path": "(误报记录)", "value": "暂无记录；先用「导出报告」再用「登记误报候选」。",
+            }]
+            return ActionResult(
+                action=action_id, message="误报候选记录 %d 条（文件：%s）。\n"
+                        "记录仅供参考，不会自动修改规则；复核后请自行调整规则库。"
+                        % (len(entries), fpath),
+                title="误报记录", show_dialog=True, data={"rows": rows},
+                report={"fp_file": fpath, "pending": len(entries)},
+            )
+
         db = load_db(path)
         errors, statuses, enabled = validate_db(db)
         n_enabled = len(enabled)
 
         if action_id == "validate":
             rows = self._validate_rows(statuses, errors)
+            pending_fp = len(read_fp(fp_path(ctx)))
+            fp_note = ("\n误报候选待复核：%d 条（用「查看误报记录」查看）。" % pending_fp
+                       if pending_fp else "")
             msg = ("规则 %d 条：可启用 %d / 无效或未启用 %d；校验错误 %d 条。\n\n"
-                   "校验错误不会被执行。T3 与占位符出处不得启用。"
-                   % (len(statuses), n_enabled, len(statuses) - n_enabled, len(errors)))
+                   "校验错误不会被执行。T3 与占位符出处不得启用。%s"
+                   % (len(statuses), n_enabled, len(statuses) - n_enabled, len(errors),
+                      fp_note))
             return ActionResult(
                 action=action_id, message=msg, title="规则校验", show_dialog=True,
                 data={"rows": rows},
@@ -444,6 +543,62 @@ class Module(ModuleBase):
             )
 
         raise RuntimeError("模块 %s 不支持操作：%s" % (self.meta["id"], action_id))
+
+    def _fp_mark(self, action_id, ctx, log):
+        report_file = getattr(ctx, "pick", "") or ""
+        if not report_file or not os.path.isfile(report_file):
+            return ActionResult(
+                action=action_id, ok=False, show_dialog=True, title="登记误报候选",
+                message="未选择有效的报告 JSON 文件。", data={"rows": []},
+                report={"logged": 0},
+            )
+        try:
+            with open(report_file, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            return ActionResult(
+                action=action_id, ok=False, show_dialog=True, title="登记误报候选",
+                message="报告 JSON 解析失败：%s" % exc, data={"rows": []},
+                report={"logged": 0},
+            )
+        matches = extract_matches_from_report(data)
+        if not matches:
+            return ActionResult(
+                action=action_id, ok=False, show_dialog=True, title="登记误报候选",
+                message="该报告里没有找到特征库命中（matches 为空或结构不符）。\n"
+                        "请先「按库扫描」并「导出报告」，再选该报告文件。",
+                data={"rows": []}, report={"logged": 0},
+            )
+        stamp = datetime.now().isoformat()
+        entries = [{
+            "time": stamp,
+            "rule_id": m.get("id", ""),
+            "path": m.get("path", ""),
+            "value": m.get("value", ""),
+            "source": m.get("source", ""),
+            "evidence": m.get("evidence", ""),
+            "report": report_file,
+            "status": "待复核",
+        } for m in matches]
+        fpath = fp_path(ctx)
+        added = append_fp(fpath, entries)
+        skipped = len(entries) - added
+        log("误报候选登记完成：新增 %d，重复跳过 %d。" % (added, skipped))
+        rows = [{
+            "id": m.get("id", "-"), "type": m.get("type", "-"),
+            "level": "待核", "path": m.get("path", ""),
+            "value": "规则值：%s" % str(m.get("value", ""))[:120],
+        } for m in matches] or [{"id": "-", "type": "-", "level": "信息",
+                                 "path": "(误报)", "value": "无命中"}]
+        return ActionResult(
+            action=action_id, message="已登记误报候选 %d 条（重复跳过 %d 条）。\n"
+                    "记录文件：%s\n\n注意：这只是复核参考，不会自动修改规则；\n"
+                    "确认误报后请自行从规则库移除或停用对应规则。"
+                    % (added, skipped, fpath),
+            title="登记误报候选", show_dialog=True, data={"rows": rows},
+            report={"fp_file": fpath, "logged": added, "duplicates": skipped,
+                    "total_matches": len(matches)},
+        )
 
     def _import_pack(self, action_id, path, ctx, log):
         pack_path = getattr(ctx, "pick", "") or ""

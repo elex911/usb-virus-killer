@@ -13,6 +13,7 @@
 """
 import os
 import re
+from datetime import datetime
 
 from core.api import Action, ActionResult, ModuleBase
 from core.widgets import ResultTable
@@ -235,6 +236,77 @@ def collect(log=lambda m: None):
     return rows
 
 
+def _fix_command_for(row):
+    """把一条诊断发现映射为 (类型, 正文)。
+
+    类型：command=可注释掉的 PowerShell 命令；note=仅人工处理建议。
+    解析失败或信息级行一律给 note。所有命令默认注释，由用户复核后自行执行。
+    """
+    kind = str(row.get("kind", ""))
+    path = str(row.get("path", "") or "")
+    if not path or path in ("-", "(AMSI)"):
+        return "note", "项无法解析出注册表路径，请人工处理。"
+    if kind in ("Winlogon", "服务"):
+        return "note", ("涉及登录 Shell / 服务 DLL，误改可能导致系统无法启动，"
+                        "请人工确认后手动处理（services.msc / 注册表编辑器）。")
+    parts = path.split("\\")
+    if len(parts) < 3:
+        return "note", "注册表路径不完整，请人工处理。"
+    label = parts[0]
+    hive = {"HKCU": "HKCU:", "HKLM": "HKLM:"}.get(label.upper())
+    if hive is None:
+        return "note", "未知注册表配置单元 %s，请人工处理。" % label
+    value_name = parts[-1]
+    key_path = hive + "\\" + "\\".join(parts[1:-1])
+    if kind == "AppInit":
+        cmd = ("Set-ItemProperty -Path '%s' -Name '%s' -Value ''"
+               % (key_path, value_name.replace("'", "''")))
+        note = "清空 AppInit_DLLs（会立即影响所有进程加载行为，请先确认无误）"
+        return "command", (cmd, note)
+    cmd = ("Remove-ItemProperty -Path '%s' -Name '%s'"
+           % (key_path, value_name.replace("'", "''")))
+    return "command", (cmd, None)
+
+
+def build_fix_script(rows, out_path, generated_at):
+    """生成默认全注释的修复脚本；返回 (命令数, 建议数)。"""
+    lines = [
+        "# 主机诊断修复脚本（由 usb-virus-killer 生成）",
+        "# 生成时间：%s" % generated_at,
+        "#",
+        "# 使用说明（务必先读）：",
+        "#   1. 本脚本所有命令默认注释，本工具不会替你执行任何修改。",
+        "#   2. 逐条复核后，把确认要执行的行去掉行首 \"# \" 再运行。",
+        "#   3. 执行前请自行备份对应注册表项（reg export）或创建系统还原点。",
+        "#   4. 高危/关注是待核疑点，不是病毒确认；不确定的项宁可跳过。",
+        "#",
+    ]
+    n_cmd = n_note = 0
+    for i, row in enumerate(rows, 1):
+        if row.get("level") not in (LEVEL_HIGH, LEVEL_WARN):
+            continue
+        kind = str(row.get("kind", ""))
+        lines.append("# ---- 第 %d 项 [%s] %s ----" % (i, row.get("level"), kind))
+        lines.append("# 位置：%s" % row.get("path", ""))
+        lines.append("# 值数据：%s" % str(row.get("value", ""))[:200])
+        lines.append("# 说明：%s" % str(row.get("detail", ""))[:200])
+        typ, body = _fix_command_for(row)
+        if typ == "command":
+            cmd, extra = body
+            if extra:
+                lines.append("# 注意：%s" % extra)
+            lines.append("# " + cmd)
+            n_cmd += 1
+        else:
+            lines.append("# 建议：%s" % body)
+            n_note += 1
+        lines.append("")
+    lines.append("# 本脚本未包含任何未注释的命令。")
+    with open(out_path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+        f.write("\n".join(lines) + "\n")
+    return n_cmd, n_note
+
+
 class Module(ModuleBase):
     meta = {
         "id": "host_diagnostics",
@@ -255,6 +327,13 @@ class Module(ModuleBase):
                         "  · 可疑服务 DLL 路径\n\n"
                         "结果中的「高危/关注」仅为待核疑点，不代表已确认病毒。\n继续？",
                 target_mode="none", order=10,
+            ),
+            Action(
+                "fixscript", "导出修复脚本",
+                confirm="将把最近一次「主机诊断(只读)」的高危/关注项生成 PowerShell 修复脚本。\n"
+                        "脚本内所有命令默认注释，本工具不会替你执行；\n"
+                        "逐条复核、备份注册表后再自行取消注释执行。\n继续？",
+                target_mode="none", order=20,
             ),
         ]
 
@@ -283,14 +362,19 @@ class Module(ModuleBase):
         )
 
     def run(self, action_id, ctx, log):
+        if action_id == "fixscript":
+            return self._fixscript(action_id, ctx, log)
+
         rows = collect(log)
+        self._last_rows = rows
+        self._last_time = datetime.now().isoformat()
         n_high = sum(1 for r in rows if r["level"] == LEVEL_HIGH)
         n_warn = sum(1 for r in rows if r["level"] == LEVEL_WARN)
         return ActionResult(
             action=action_id,
             message="共 %d 条：高危 %d / 关注 %d / 信息 %d。\n\n"
                     "「高危/关注」是待核疑点，未做任何修改。\n"
-                    "如需处理，请人工核实后自行操作，或交由正规杀毒软件。"
+                    "如需处理，请人工核实后自行操作，或用「导出修复脚本」生成待审脚本。"
                     % (len(rows), n_high, n_warn, len(rows) - n_high - n_warn),
             title="只读诊断完成", show_dialog=True,
             data={"rows": rows},
@@ -298,4 +382,42 @@ class Module(ModuleBase):
                 "host_diagnostics_readonly": rows,
                 "caution": "只读疑点登记（高危/关注/信息），非病毒确认，未做任何修改。",
             },
+        )
+
+    def _fixscript(self, action_id, ctx, log):
+        rows = getattr(self, "_last_rows", None)
+        if not rows:
+            return ActionResult(
+                action=action_id, ok=False, show_dialog=True, title="导出修复脚本",
+                message="还没有诊断结果。请先点「主机诊断(只读)」，再导出修复脚本。",
+                data={"rows": []}, report={"written": 0},
+            )
+        targets = [r for r in rows if r.get("level") in (LEVEL_HIGH, LEVEL_WARN)]
+        if not targets:
+            return ActionResult(
+                action=action_id, message="最近一次诊断没有高危/关注项，无需修复脚本。",
+                title="导出修复脚本", show_dialog=True,
+                data={"rows": [{"kind": "脚本", "level": "信息", "path": "(修复脚本)",
+                                "value": "无可处理项", "detail": "诊断结果均为信息级"}]},
+                report={"written": 0, "commands": 0, "notes": 0},
+            )
+        app_dir = ctx.app_dir or os.getcwd()
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(app_dir, "修复脚本_主机诊断_%s.ps1" % stamp)
+        generated_at = getattr(self, "_last_time", "") or datetime.now().isoformat()
+        n_cmd, n_note = build_fix_script(rows, out_path, generated_at)
+        log("修复脚本已生成：%s（命令 %d 条，人工建议 %d 条）" % (out_path, n_cmd, n_note))
+        msg = ("修复脚本已生成（默认全部注释，未执行任何命令）：\n%s\n\n"
+               "可注释命令 %d 条 / 人工处理建议 %d 条。\n"
+               "请逐条复核、备份注册表后再自行取消注释执行。"
+               % (out_path, n_cmd, n_note))
+        return ActionResult(
+            action_id, message=msg, title="导出修复脚本", show_dialog=True,
+            data={"rows": [{"kind": "脚本", "level": "信息", "path": out_path,
+                            "value": "可注释命令 %d 条 / 人工建议 %d 条"
+                                     % (n_cmd, n_note),
+                            "detail": "全部命令默认注释；复核后自行执行"}]},
+            report={"written": 1, "fixscript": out_path,
+                    "commands": n_cmd, "notes": n_note,
+                    "high_or_warn": len(targets)},
         )
