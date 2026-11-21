@@ -30,6 +30,9 @@ DRIVE_TYPES = {
     3: "本地固定磁盘", 4: "网络驱动器", 5: "光驱", 6: "内存盘",
 }
 
+# 隔离区目录前缀：扫描剪枝与 clean 建目录同源（界面提示文案单独保留字面量）
+QUARANTINE_PREFIX = "__WORM_QUARANTINE_"
+
 try:
     k32 = ctypes.windll.kernel32
     k32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
@@ -161,6 +164,8 @@ class Engine:
         log("开始枚举文件（只读）…")
         all_items = []
         for dirpath, dirnames, filenames in os.walk(self.root):
+            # 自身隔离区不重扫：已隔离对象不再判级/记隐藏（防止重扫复报与回滚干扰）
+            dirnames[:] = [d for d in dirnames if not d.startswith(QUARANTINE_PREFIX)]
             for d in dirnames:
                 try:
                     all_items.append(os.path.join(dirpath, d))
@@ -249,11 +254,17 @@ class Engine:
 
     def clean(self, log, do_restore_attrs=True):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        qdir = os.path.join(self.root, "__WORM_QUARANTINE_" + stamp)
+        qdir = os.path.join(self.root, QUARANTINE_PREFIX + stamp)
         os.makedirs(qdir, exist_ok=True)
         targets = [i for i in self.items if i["verdict"] == "恶意"]
         manifest = {"time": datetime.now().isoformat(), "root": self.root, "items": []}
 
+        def _flush():
+            # manifest 逐项落盘：隔离中途崩溃（断电/Ctrl+C）已搬入项仍可回滚
+            with open(os.path.join(qdir, "manifest.json"), "w", encoding="utf-8") as f:
+                json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+        _flush()
         moved = 0
         for it in targets:
             p = it["path"]
@@ -266,6 +277,7 @@ class Engine:
                 shutil.move(p, dest)
                 manifest["items"].append({"action": "quarantine", "rel": rel})
                 moved += 1
+                _flush()
             except Exception as e:
                 log("隔离失败 %s : %s" % (p, e))
         log("已隔离 %d 项 → %s" % (moved, qdir))
@@ -283,8 +295,6 @@ class Engine:
                     manifest["items"].append({"action": "unhide", "rel": os.path.relpath(p, self.root)})
         log("已解除隐藏属性 %d 项。" % restored)
 
-        with open(os.path.join(qdir, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
         with open(os.path.join(qdir, "README_回滚说明.txt"), "w", encoding="utf-8") as f:
             f.write("隔离时间: %s\n目标位置: %s\n\n" % (manifest["time"], self.root))
             f.write("本目录保存被隔离的病毒伪装文件，按原相对路径存放。\n")
@@ -305,10 +315,22 @@ class Engine:
         for it in manifest.get("items", []):
             if it.get("action") != "quarantine":
                 continue
-            rel = it["rel"]
+            rel = str(it.get("rel") or "")
+            # 危险路径防护：manifest 是隔离区内的可编辑文件，rel 必须是根内的相对路径
+            norm = os.path.normpath(rel) if rel else ""
+            if (not norm or norm.startswith("..") or os.path.isabs(norm)
+                    or (len(norm) >= 2 and norm[1] == ":")):
+                log("回滚拒绝可疑路径（穿越/绝对路径）：%r" % rel)
+                fail += 1
+                continue
             src = os.path.join(qdir, rel)
             dst = os.path.join(root, rel)
             if not os.path.exists(src):
+                fail += 1
+                continue
+            if os.path.exists(dst):
+                # 不覆盖用户现有文件：宁可该项回滚失败留给人工，也不静默吞掉现状
+                log("回滚跳过（目标已存在，不覆盖）：%s" % dst)
                 fail += 1
                 continue
             try:

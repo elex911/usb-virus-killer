@@ -99,6 +99,20 @@ def test_engine_and_rollback():
         assert attr is not None and not (attr & fv.FILE_ATTRIBUTE_HIDDEN), attr
         print("[OK] 查杀隔离 + 解除隐藏:", r)
 
+        # P2 回归：重扫不得把自身隔离区 __WORM_QUARANTINE_* 里的对象再判为目标
+        qdir = r["quarantine"]
+        eng2 = fv.Engine(tmp, False)
+        eng2.precheck()
+        eng2.scan(lambda m: None)
+        qn = os.path.normcase(os.path.abspath(qdir)) + os.sep
+        leaked = [i for i in eng2.items
+                  if os.path.normcase(os.path.abspath(i["path"])).startswith(qn)]
+        assert not leaked, "隔离区对象被重扫判级: %r" % leaked[:3]
+        leaked_hidden = [p for p in eng2.hidden_items
+                         if os.path.normcase(os.path.abspath(p)).startswith(qn)]
+        assert not leaked_hidden, "隔离区对象被重扫记为隐藏项: %r" % leaked_hidden[:3]
+        print("[OK] 重扫排除自身隔离区: 隔离对象 0 复报")
+
         manifest = os.path.join(r["quarantine"], "manifest.json")
         with open(manifest, encoding="utf-8") as f:
             mf = json.load(f)
@@ -113,6 +127,114 @@ def test_engine_and_rollback():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_restore_safety():
+    """危险路径复审回归：回滚拒绝路径穿越、拒绝覆盖已存在文件；clean 中途崩溃 manifest 不丢。"""
+    import unittest.mock as um
+
+    # ---- 场景一：正常隔离后，验证 restore 的两道防线 ----
+    tmp = tempfile.mkdtemp(prefix="fk_restore_", dir=ROOT)
+    try:
+        usb = os.path.join(tmp, "usb")
+        original = os.path.join(usb, "照片.jpg")
+        os.makedirs(usb)
+        with open(original, "wb") as f:
+            f.write(b"img")
+        fv.set_attr(original, fv.FILE_ATTRIBUTE_HIDDEN | fv.FILE_ATTRIBUTE_SYSTEM)
+        fake_lnk = os.path.join(usb, "照片.lnk")
+        make_lnk(fake_lnk, original)
+        eng = fv.Engine(usb, False)
+        eng.precheck()
+        eng.scan(lambda m: None)
+        r = eng.clean(lambda m: None)
+        qdir = r["quarantine"]
+        mf_path = os.path.join(qdir, "manifest.json")
+        with open(mf_path, encoding="utf-8") as f:
+            mf = json.load(f)
+        assert any(i.get("action") == "quarantine" for i in mf["items"]), mf
+
+        # B) 目标位置已存在同名文件 → 该项失败、原文件内容不变、隔离区文件不丢
+        with open(fake_lnk, "wb") as f:
+            f.write(b"IMPORTANT-DO-NOT-OVERWRITE")
+        okc, fail = fv.Engine.restore(qdir, lambda m: None)
+        assert okc == 0 and fail >= 1, (okc, fail)
+        with open(fake_lnk, "rb") as f:
+            assert f.read() == b"IMPORTANT-DO-NOT-OVERWRITE"
+        assert os.path.exists(os.path.join(qdir, "照片.lnk")), "隔离区源文件不得被消费掉"
+        print("[OK] 回滚拒绝覆盖已存在目标")
+
+        # A) 篡改 manifest 的 rel 为路径穿越 → 必须拒绝且不写出隔离区
+        mf2 = json.loads(json.dumps(mf))
+        outside = os.path.join(tmp, "outside_evil.txt")
+        for it in mf2["items"]:
+            if it.get("action") == "quarantine":
+                it["rel"] = os.path.join("..", "..", "outside_evil.txt")
+                break
+        with open(mf_path, "w", encoding="utf-8") as f:
+            json.dump(mf2, f)
+        okc, fail = fv.Engine.restore(qdir, lambda m: None)
+        assert okc == 0 and fail >= 1, (okc, fail)
+        assert not os.path.exists(outside), "路径穿越被成功执行（严重漏洞）"
+        # 绝对路径同样拒绝
+        mf3 = json.loads(json.dumps(mf))
+        for it in mf3["items"]:
+            if it.get("action") == "quarantine":
+                it["rel"] = os.path.abspath(outside)
+                break
+        with open(mf_path, "w", encoding="utf-8") as f:
+            json.dump(mf3, f)
+        okc, fail = fv.Engine.restore(qdir, lambda m: None)
+        assert okc == 0 and fail >= 1 and not os.path.exists(outside), (okc, fail)
+        print("[OK] 回滚拒绝路径穿越/绝对路径")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # ---- 场景二：clean 中途被 Ctrl+C 打断，manifest 必须已逐项落盘 ----
+    tmp2 = tempfile.mkdtemp(prefix="fk_crash_", dir=ROOT)
+    try:
+        usb2 = os.path.join(tmp2, "usb")
+        os.makedirs(usb2)
+        targets = []
+        for name in ("照片.jpg", "账单.pdf"):
+            orig = os.path.join(usb2, name)
+            with open(orig, "wb") as f:
+                f.write(b"data")
+            fv.set_attr(orig, fv.FILE_ATTRIBUTE_HIDDEN | fv.FILE_ATTRIBUTE_SYSTEM)
+            lnk = os.path.join(usb2, name.rsplit(".", 1)[0] + ".lnk")
+            make_lnk(lnk, orig)
+            targets.append(lnk)
+        eng3 = fv.Engine(usb2, False)
+        eng3.precheck()
+        eng3.scan(lambda m: None)
+        real_move = shutil.move
+        calls = {"n": 0}
+
+        def flaky_move(src, dst, *a, **kw):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise KeyboardInterrupt  # 模拟用户中途 Ctrl+C
+            return real_move(src, dst, *a, **kw)
+
+        raised = False
+        with um.patch("shutil.move", flaky_move):
+            try:
+                eng3.clean(lambda m: None)
+            except KeyboardInterrupt:
+                raised = True
+        assert raised, "中断必须向上传播（不得被吞掉伪装成功）"
+        import glob as _g
+        qdirs = _g.glob(os.path.join(usb2, "__WORM_QUARANTINE_*"))
+        assert len(qdirs) == 1, qdirs
+        mf2p = os.path.join(qdirs[0], "manifest.json")
+        assert os.path.isfile(mf2p), "中断后 manifest 丢失＝隔离项不可回滚"
+        with open(mf2p, encoding="utf-8") as f:
+            mf2 = json.load(f)
+        done = [i for i in mf2["items"] if i.get("action") == "quarantine"]
+        assert len(done) == 1, "第 1 项已搬入隔离区但清单未记录: %r" % mf2
+        print("[OK] clean 中途中断：已隔离项 manifest 逐项落盘，可回滚")
+    finally:
+        shutil.rmtree(tmp2, ignore_errors=True)
+
+
 def test_host_diagnostics():
     import HostDiagnostics
     rows = HostDiagnostics.collect(lambda m: None)
@@ -120,6 +242,37 @@ def test_host_diagnostics():
     assert all(r["level"] in ("高危", "关注", "信息") for r in rows)
     assert all(r["level"] != "恶意" for r in rows)
     print("[OK] 主机诊断只读口径: %d 行" % len(rows))
+
+
+def test_classic_rollback_tampered_item():
+    """危险路径复审：回滚 manifest 含坏项（未知 hive）不得中断剩余项的还原。"""
+    from modules import classic_trojans as ct
+    app_dir = tempfile.mkdtemp(prefix="fk_rbt_", dir=ROOT)
+    try:
+        ct._reset_seams()
+        bdir = os.path.join(app_dir, "legacy_fix_backups", "20260101_000000_000000")
+        os.makedirs(bdir)
+        mf = {"time": "2026-01-01T00:00:00", "applied": [
+            {"kind": "启动项", "hive": "HKXX", "subkey": "X", "name": "Bad",
+             "action": "delete_value", "old_value": "v", "old_type": 1},
+            {"kind": "启动项", "hive": "HKLM", "subkey": "Software\\TestApp",
+             "name": "KV2004", "action": "delete_value",
+             "old_value": "C:\\evil.exe", "old_type": 1},
+        ]}
+        with open(os.path.join(bdir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(mf, f)
+        sets_ = []
+        ct._reg_set = lambda hive, sk, n, v, t: sets_.append((hive, sk, n, v, t))
+        mod = ct.Module()
+        mod.collect = lambda log: ([], [])  # 回滚后的复核用空数据，隔离真实注册表
+        ctx = Context(app_dir=app_dir)
+        res = mod.run("rollback", ctx, lambda m: None)
+        assert res.report["restored"] == 1, "坏项之后的好项被中断: %r" % res.report
+        assert len(sets_) == 1 and sets_[0][1] == "Software\\TestApp", sets_
+        ct._reset_seams()
+        print("[OK] 经典木马回滚: 坏 manifest 项跳过不中断，好项照常还原")
+    finally:
+        shutil.rmtree(app_dir, ignore_errors=True)
 
 
 def test_signature_db_empty_and_rules():

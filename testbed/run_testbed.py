@@ -418,6 +418,113 @@ def s_fixscript_fp(log):
 
 # ---------------- 执行器 ----------------
 
+@case("17 异常目标与锁定文件（优雅失败）")
+def s_exceptions(log):
+    tmp = tempfile.mkdtemp(prefix="tb_excep_", dir=RESULTS_DIR)
+    checks = {}
+    # a) 根目录不存在：必须是带中文说明的 RuntimeError
+    eng = fv.Engine(os.path.join(tmp, "no_such_dir"), False)
+    try:
+        eng.precheck()
+        checks["missing_root"] = "未拒绝（BUG）"
+    except RuntimeError as exc:
+        checks["missing_root"] = "已拒绝" if "目标不存在" in str(exc) else "拒绝但文案不符"
+    except Exception as exc:
+        checks["missing_root"] = "异常类型错误: %r" % (exc,)
+    # b) 根目录是文件而非文件夹
+    fpath = os.path.join(tmp, "plain.txt")
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write("x")
+    eng2 = fv.Engine(fpath, False)
+    try:
+        eng2.precheck()
+        checks["file_root"] = "未拒绝（BUG）"
+    except RuntimeError as exc:
+        checks["file_root"] = "已拒绝" if "不是文件夹" in str(exc) else "拒绝但文案不符"
+    except Exception as exc:
+        checks["file_root"] = "异常类型错误: %r" % (exc,)
+    # c) 锁定文件（独占句柄）+ content_regex：逐文件失败记 error，不崩溃、不误报
+    import ctypes
+    db_path = os.path.join(tmp, "signature_db.json")
+    ctx = Context(app_dir=tmp, settings={"signature_db_path": db_path})
+    sig.Module().run("init", ctx, log)
+    with io.open(db_path, encoding="utf-8") as f:
+        db = json.load(f)
+    db["rules"].append({"id": "R-LOCK-1", "type": "content_regex", "value": "hello",
+                        "source": "测试台合成规则", "evidence": "T1",
+                        "first_seen": time.strftime("%Y-%m-%d"), "enabled": True})
+    with io.open(db_path, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False)
+    target = os.path.join(tmp, "usb")
+    os.makedirs(target)
+    with open(os.path.join(target, "normal.txt"), "w", encoding="utf-8") as f:
+        f.write("hello world\n")
+    locked = os.path.join(target, "locked.log")
+    with open(locked, "w", encoding="utf-8") as f:
+        f.write("hello locked\n")
+    GENERIC_READ = 0x80000000
+    OPEN_EXISTING = 3
+    h = ctypes.windll.kernel32.CreateFileW(
+        locked, GENERIC_READ, 0, None, OPEN_EXISTING, 0, None)
+    checks["lock_handle"] = bool(h and h != -1)
+    try:
+        sctx = Context(app_dir=tmp, settings={"signature_db_path": db_path})
+        sctx.target = target
+        sctx.is_drive = False
+        res = sig.Module().run("scan", sctx, log)
+        hits = [m for m in res.report.get("matches", [])]
+        hit_paths = [os.path.normcase(m["path"]) for m in hits]
+        checks["scan_ok"] = bool(res.ok)
+        checks["hits"] = len(hits)
+        checks["only_normal"] = hit_paths == [os.path.normcase(os.path.join(target, "normal.txt"))]
+        checks["errors_recorded"] = len(res.report.get("scan_errors", []) or []) >= 1
+    finally:
+        if h and h != -1:
+            ctypes.windll.kernel32.CloseHandle(h)
+    ok = (checks.get("missing_root") == "已拒绝"
+          and checks.get("file_root") == "已拒绝"
+          and checks.get("lock_handle")
+          and checks.get("scan_ok") and checks.get("hits") == 1
+          and checks.get("only_normal") and checks.get("errors_recorded"))
+    return ok, checks, tmp
+
+
+@case("18 损坏规则库（优雅失败链）")
+def s_corrupt_db(log):
+    tmp = tempfile.mkdtemp(prefix="tb_baddb_", dir=RESULTS_DIR)
+    checks = {}
+    db_path = os.path.join(tmp, "signature_db.json")
+    # a) 库文件是乱码字节：init 绝不覆盖；validate 必须给中文 RuntimeError
+    with open(db_path, "wb") as f:
+        f.write(b"\xff\xfe{not json!!!")
+    ctx = Context(app_dir=tmp, settings={"signature_db_path": db_path})
+    mod = sig.Module()
+    r_init = mod.run("init", ctx, log)
+    checks["init_not_overwrite"] = (r_init.report.get("created") is False)
+    try:
+        mod.run("validate", ctx, log)
+        checks["garbage"] = "未拒绝（BUG：坏库静默通过）"
+    except RuntimeError as exc:
+        checks["garbage"] = "中文拒绝" if ("特征库" in str(exc) and "解析失败" in str(exc)) else "拒绝但文案不符"
+    except Exception as exc:
+        checks["garbage"] = "异常类型错误: %r" % (exc,)
+    # b) JSON 合法但根节点是数组：validate 优雅列出错误不崩溃
+    with io.open(db_path, "w", encoding="utf-8") as f:
+        json.dump([1, 2, 3], f)
+    r2 = mod.run("validate", ctx, log)
+    errs2 = r2.report.get("errors", [])
+    checks["array_root"] = bool(r2.ok) and any("根节点" in e for e in errs2)
+    # c) 根节点对象但 rules 不是数组
+    with io.open(db_path, "w", encoding="utf-8") as f:
+        json.dump({"rules": "oops"}, f)
+    r3 = mod.run("validate", ctx, log)
+    errs3 = r3.report.get("errors", [])
+    checks["rules_not_list"] = bool(r3.ok) and any("rules 必须是数组" in e for e in errs3)
+    ok = (checks.get("init_not_overwrite") and checks.get("garbage") == "中文拒绝"
+          and checks.get("array_root") and checks.get("rules_not_list"))
+    return ok, checks, tmp
+
+
 def exe_info():
     dist = os.path.join(ROOT, "dist")
     out = {"exe_built": None, "exe_bytes": None}

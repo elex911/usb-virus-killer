@@ -454,7 +454,11 @@ class Module(ModuleBase):
             manifest = json.load(f)
         restored = 0
         for item in manifest.get("applied", []):
-            hive = HIVE_NAMES[item["hive"]]
+            try:
+                hive = HIVE_NAMES[item["hive"]]
+            except (KeyError, TypeError):
+                log("回滚跳过损坏项（未知 hive）：%r" % item.get("hive"))
+                continue
             # 按备份记录的原类型还原（旧备份无 old_type 时退回 REG_SZ 兼容）
             old_type = item.get("old_type", winreg.REG_SZ)
             old_value = item["old_value"]
