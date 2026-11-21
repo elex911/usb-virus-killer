@@ -35,8 +35,14 @@ CAUTION = (
 EMPTY_DB = {
     "schema_version": SCHEMA_VERSION,
     "_readme": CAUTION,
+    "db_version": 0,
+    "updated_at": "",
+    "packs": [],
     "rules": [],
 }
+
+BACKUP_DIRNAME = "signature_db_backups"
+MAX_BACKUPS = 10
 
 
 def db_path(ctx):
@@ -154,6 +160,36 @@ def validate_db(db):
     return errors, statuses, enabled
 
 
+def backup_db(path):
+    """导入规则包前备份当前库；保留最近 MAX_BACKUPS 份，返回备份路径。"""
+    if not os.path.isfile(path):
+        return ""
+    parent = os.path.dirname(os.path.abspath(path))
+    bdir = os.path.join(parent, BACKUP_DIRNAME)
+    os.makedirs(bdir, exist_ok=True)
+    cur = load_db(path)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(bdir, "%s_v%s.json" % (stamp, cur.get("db_version", 0)))
+    with open(path, "rb") as src, open(dest, "wb") as dst:
+        dst.write(src.read())
+    backups = sorted(f for f in os.listdir(bdir) if f.endswith(".json"))
+    for old in backups[:-MAX_BACKUPS]:
+        try:
+            os.remove(os.path.join(bdir, old))
+        except OSError:
+            pass
+    return dest
+
+
+def latest_backup(path):
+    parent = os.path.dirname(os.path.abspath(path))
+    bdir = os.path.join(parent, BACKUP_DIRNAME)
+    if not os.path.isdir(bdir):
+        return ""
+    files = sorted(f for f in os.listdir(bdir) if f.endswith(".json"))
+    return os.path.join(bdir, files[-1]) if files else ""
+
+
 def _hash_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -237,6 +273,13 @@ class Module(ModuleBase):
             Action("scan", "按库扫描(只读)", target_mode="required",
                    confirm="将只读扫描目标文件并报告规则命中，不隔离、不删除。\n继续？",
                    order=30),
+            Action("import_pack", "导入规则包(版本化)", target_mode="none", prompt="file",
+                   prompt_title="选择规则包 JSON 文件",
+                   confirm="规则包必须是带 name/version/source/rules 的 JSON。\n"
+                           "version 必须大于当前库版本（禁止降级/重复导入）；\n"
+                           "导入前自动备份当前库，可回滚。继续？",
+                   order=40),
+            Action("rollback_db", "回滚上次导入", target_mode="none", order=50),
         ]
 
     def prepare_context(self, ctx, raw_target, allow_fixed=False):
@@ -374,4 +417,126 @@ class Module(ModuleBase):
                 },
             )
 
+        if action_id == "import_pack":
+            return self._import_pack(action_id, path, ctx, log)
+
+        if action_id == "rollback_db":
+            bk = latest_backup(path)
+            if not bk:
+                return ActionResult(
+                    action=action_id, ok=False, show_dialog=True, title="回滚上次导入",
+                    message="没有可回滚的备份（尚未导入过规则包）。",
+                    data={"rows": [{"id": "-", "type": "-", "level": "信息",
+                                    "path": "(回滚)", "value": "无备份"}]},
+                    report={"restored": 0},
+                )
+            src = load_db(bk)
+            cur_ver = load_db(path).get("db_version", 0)
+            with open(bk, "rb") as fsrc, open(path, "wb") as fdst:
+                fdst.write(fsrc.read())
+            msg = "已回滚到备份：%s（库版本 %s → %s）。" % (
+                os.path.basename(bk), cur_ver, src.get("db_version", 0))
+            return ActionResult(
+                action=action_id, message=msg, title="回滚上次导入", show_dialog=True,
+                data={"rows": [{"id": "-", "type": "-", "level": "信息",
+                                "path": bk, "value": msg}]},
+                report={"restored": 1, "backup": bk, "db_version": src.get("db_version", 0)},
+            )
+
         raise RuntimeError("模块 %s 不支持操作：%s" % (self.meta["id"], action_id))
+
+    def _import_pack(self, action_id, path, ctx, log):
+        pack_path = getattr(ctx, "pick", "") or ""
+        if not pack_path or not os.path.isfile(pack_path):
+            return ActionResult(
+                action=action_id, ok=False, show_dialog=True, title="导入规则包",
+                message="未选择有效的规则包文件。",
+                data={"rows": []}, report={"imported": 0},
+            )
+        try:
+            with open(pack_path, encoding="utf-8") as f:
+                pack = json.load(f)
+        except Exception as exc:
+            return ActionResult(
+                action=action_id, ok=False, show_dialog=True, title="导入规则包",
+                message="规则包 JSON 解析失败：%s" % exc, data={"rows": []},
+                report={"imported": 0},
+            )
+        if isinstance(pack, dict) and isinstance(pack.get("pack"), dict):
+            pack = pack["pack"]
+
+        name = str(pack.get("name") or "").strip()
+        source = str(pack.get("source") or "").strip()
+        version = pack.get("version")
+        rules = pack.get("rules")
+        errs = []
+        if not name or name.lower() in PLACEHOLDER_SOURCES:
+            errs.append("pack.name 不能为空/占位")
+        if source.lower() in PLACEHOLDER_SOURCES:
+            errs.append("pack.source 必须是可核出处")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            errs.append("pack.version 必须是 >=1 的整数")
+        if not isinstance(rules, list) or not rules:
+            errs.append("pack.rules 必须是非空数组")
+
+        db = load_db(path)
+        cur_ver = int(db.get("db_version", 0) or 0)
+        imported_versions = {p.get("version") for p in db.get("packs", [])}
+        if isinstance(version, int) and version <= cur_ver:
+            errs.append("版本必须大于当前库版本 %d（禁止降级）" % cur_ver)
+        if isinstance(version, int) and version in imported_versions:
+            errs.append("版本 %d 已导入过，禁止重复导入" % version)
+        if errs:
+            return ActionResult(
+                action=action_id, ok=False, show_dialog=True, title="导入规则包",
+                message="规则包校验未通过：\n- " + "\n- ".join(errs),
+                data={"rows": [{"id": "-", "type": "-", "level": "规则错误",
+                                "path": pack_path, "value": e} for e in errs]},
+                report={"imported": 0, "errors": errs},
+            )
+
+        perr, pstat, _pen = validate_db({"rules": rules})
+        if perr:
+            return ActionResult(
+                action=action_id, ok=False, show_dialog=True, title="导入规则包",
+                message="规则包内 %d 条规则校验失败，整包拒绝（不做部分导入）。\n%s"
+                        % (len(perr), "；".join(perr[:6])),
+                data={"rows": self._validate_rows(pstat, perr)},
+                report={"imported": 0, "errors": perr},
+            )
+
+        backup = backup_db(path)
+        old_ids = {r.get("id") for r in db.get("rules", []) if isinstance(r, dict)}
+        new_ids = [r.get("id") for r in rules]
+        replaced = len(old_ids & set(new_ids))
+        merged = [r for r in db.get("rules", []) if r.get("id") not in set(new_ids)] + rules
+        packs = list(db.get("packs", []))
+        packs.append({
+            "name": name, "version": version, "source": source,
+            "sha256": _hash_file(pack_path),
+            "imported_at": datetime.now().isoformat(),
+            "rule_count": len(rules), "replaced": replaced,
+        })
+        new_db = {
+            "schema_version": SCHEMA_VERSION, "_readme": CAUTION,
+            "db_version": version,
+            "updated_at": datetime.now().isoformat(),
+            "packs": packs, "rules": merged,
+        }
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(new_db, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        log("规则包已导入：v%d，规则 %d 条（替换 %d 条）。" % (version, len(rules), replaced))
+        msg = ("规则包导入成功：%s v%d\n新增/更新 %d 条规则（替换同 id %d 条）；"
+               "库版本 %d → %d。\n备份：%s"
+               % (name, version, len(rules), replaced, cur_ver, version,
+                  backup or "(原库为空，无备份)"))
+        return ActionResult(
+            action=action_id, message=msg, title="导入规则包", show_dialog=True,
+            data={"rows": [{"id": "-", "type": "-", "level": "信息",
+                            "path": path, "value": msg}]},
+            report={"imported": 1, "pack": name, "version": version,
+                    "rule_count": len(rules), "replaced": replaced,
+                    "db_version": version, "backup": backup, "sha256": packs[-1]["sha256"]},
+        )

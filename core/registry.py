@@ -18,6 +18,7 @@ from .api import ModuleBase
 # 新增内置功能时，只在这里加一行 import 路径；主程序无需改动。
 BUILTIN_MODULES = (
     "modules.folder_virus",
+    "modules.classic_trojans",
     "modules.host_diagnostics",
     "modules.signature_db",
     "modules.clamav_bridge",

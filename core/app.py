@@ -222,6 +222,14 @@ class App:
             if not pick:
                 return
             self.ctx.pick = pick
+        elif action.prompt == "file":
+            pick = filedialog.askopenfilename(
+                title=action.prompt_title or "选择文件",
+                filetypes=[("规则包 JSON", "*.json"), ("所有文件", "*.*")],
+            )
+            if not pick:
+                return
+            self.ctx.pick = pick
 
         self._set_busy(True)
         threading.Thread(target=self._worker, args=(mod, action), daemon=True).start()

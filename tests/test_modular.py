@@ -27,6 +27,7 @@ def test_discovery():
     mods, errors = load_modules()
     ids = [m.meta.get("id") for m in mods]
     assert "folder_virus" in ids, ids
+    assert "classic_trojans" in ids, ids
     assert "host_diagnostics" in ids, ids
     assert "signature_db" in ids, ids
     assert "clamav_bridge" in ids, ids
@@ -289,6 +290,123 @@ def test_modern_threats():
           % len(real.data["rows"]))
 
 
+def test_classic_trojans():
+    """QQKav 移植模块：接缝注入验证 检出→修复→回滚 三链路 + 真实主机低噪音。"""
+    from modules import classic_trojans as ct
+
+    # 真实主机：只读体检不得报任何高危（本机干净）
+    ct._reset_seams()
+    real = ct.Module().run("detect", Context(), lambda m: None)
+    assert all(r["level"] != "高危" for r in real.data["rows"]), real.data["rows"]
+
+    # 注入世界：已知 QQ 尾巴特征 + 关联劫持 + IFEO + 正常项
+    fake = {}
+    hklm_run = ("HKLM", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
+    hkcu_run = ("HKCU", r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run")
+    fake[hklm_run] = {"KV2004": (r"C:\Windows\microsoft.exe", 1),
+                      "Good": (r"C:\Program Files (x86)\App\App.exe", 1)}
+    fake[hkcu_run] = {"WebAuto": (r"C:\Windows\System32\WebAuto.exe", 1)}
+    assoc = ("HKCR", ct.TXTFILE_ASSOC)
+    fake[assoc] = {"": (r'c:\windows\winsoft "%1"', 1)}
+    ifeo = ("HKLM", ct.IFEOSUB + "\\evil.exe")
+    fake[ifeo] = {"Debugger": (r"C:\Windows\evil.dll", 1)}
+
+    deleted, sets_ = [], []
+
+    def hive_name(hive):
+        for n, h in ct.HIVE_NAMES.items():
+            if h == hive:
+                return n
+        return "?"
+
+    ct._reg_enum_values = lambda h, sk: [(n, v, t) for n, (v, t) in fake.get((hive_name(h), sk), {}).items()]
+    ct._reg_get = lambda h, sk, n: fake.get((hive_name(h), sk), {}).get(n, (None,))[0]
+    ct._reg_delete_value = lambda h, sk, n: (deleted.append((hive_name(h), sk, n)),
+                                             fake.get((hive_name(h), sk), {}).pop(n, None))
+    def _set(h, sk, n, v, t):
+        sets_.append((hive_name(h), sk, n, v))
+        fake.setdefault((hive_name(h), sk), {})[n or ""] = (v, t)
+    ct._reg_set = _set
+    ct._reg_enum_keys = lambda h, sk: (["evil.exe"]
+                                       if (hive_name(h), sk) == ("HKLM", ct.IFEOSUB) else [])
+    ct._read_hosts = lambda p: "127.0.0.1 localhost\n"
+    ct._list_shares = lambda: []
+
+    mod = ct.Module()
+    ctx = Context(app_dir=tempfile.mkdtemp(prefix="fk_ct_", dir=ROOT))
+    det = mod.run("detect", ctx, lambda m: None)
+    hi = [r for r in det.data["rows"] if r["level"] == "高危"]
+    assert len(hi) == 4, [(r["kind"], r["value"]) for r in hi]
+    assert len(det.report["fixable"]) == 4
+    assert all("Good" not in r["value"] or r["level"] == "信息"
+               for r in det.data["rows"] if r["kind"] == "启动项")
+
+    fixed = mod.run("fix", ctx, lambda m: None)
+    assert not [r for r in fixed.data["rows"] if r["level"] == "高危"], "修复后不得残留高危"
+    assert len(deleted) == 3 and len(sets_) == 1 and "NOTEPAD" in sets_[0][3].upper()
+    mf = json.load(open(os.path.join(fixed.report["fixed_backup_dir"], "manifest.json"),
+                        encoding="utf-8"))
+    assert len(mf["applied"]) == 4
+
+    rb = mod.run("rollback", ctx, lambda m: None)
+    assert rb.report["restored"] == 4, rb.report
+    assert fake[hklm_run].get("KV2004") and fake[assoc][""][0].startswith("c:")
+    print("[OK] 经典木马查杀: 注入检出 4 高危 / 修复删值3+还原关联1 / 回滚 4；真实主机 0 高危")
+
+
+def test_signature_db_pack():
+    """特征库 v2：版本化规则包 导入/降级拒绝/重复拒绝/坏规则整包拒绝/回滚。"""
+    tmp = tempfile.mkdtemp(prefix="fk_pack_", dir=ROOT)
+    try:
+        db_path = os.path.join(tmp, "signature_db.json")
+        ctx = Context(app_dir=tmp, settings={"signature_db_path": db_path})
+        mod = sig.Module()
+        mod.run("init", ctx, lambda m: None)
+
+        rule = {"id": "t_rule_a", "type": "filename_regex", "value": r"(?i)^microsoft\.exe$",
+                "source": "百度百科 Trojan/QQMsg.FakeUpdt（T3 登记，禁用）",
+                "evidence": "T3", "first_seen": "2004-06-01", "enabled": False}
+
+        def write_pack(name, obj):
+            p = os.path.join(tmp, name)
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(obj, f, ensure_ascii=False)
+            return p
+
+        ctx.pick = write_pack("p1.json", {"name": "testpack", "version": 1,
+                                          "source": "example.org/pack-v1 (T3 出处)",
+                                          "rules": [rule]})
+        r1 = mod.run("import_pack", ctx, lambda m: None)
+        assert r1.ok and sig.load_db(db_path)["db_version"] == 1, r1.message
+
+        r2 = mod.run("import_pack", ctx, lambda m: None)
+        assert not r2.ok, "同版本重复导入必须被拒绝"
+
+        ctx.pick = write_pack("p0.json", {"name": "testpack", "version": 0,
+                                          "source": "s", "rules": [rule]})
+        r0 = mod.run("import_pack", ctx, lambda m: None)
+        assert not r0.ok, "降级必须被拒绝"
+        assert sig.load_db(db_path)["db_version"] == 1
+
+        bad = dict(rule, id="t_bad", evidence="T4")
+        ctx.pick = write_pack("pb.json", {"name": "testpack", "version": 2,
+                                          "source": "example.org/pack-v2", "rules": [bad]})
+        rb = mod.run("import_pack", ctx, lambda m: None)
+        assert not rb.ok and sig.load_db(db_path)["db_version"] == 1, "坏规则整包拒绝后版本不变"
+
+        ctx.pick = write_pack("p2.json", {"name": "testpack", "version": 2,
+                                          "source": "example.org/pack-v2", "rules": [rule]})
+        r3 = mod.run("import_pack", ctx, lambda m: None)
+        assert r3.ok and sig.load_db(db_path)["db_version"] == 2
+        assert r3.report["replaced"] == 1 and r3.report["backup"], r3.report
+
+        r4 = mod.run("rollback_db", ctx, lambda m: None)
+        assert r4.ok and sig.load_db(db_path)["db_version"] == 1, r4.message
+        print("[OK] 特征库 v2: 导入/重复拒/降级拒/坏包拒/替换计数/回滚 全链路")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_clamav_log_not_contaminated():
     """clamscan --log 是追加写：上次扫描的命中不得混入本次统计（回归）。"""
     tmp = tempfile.mkdtemp(prefix="fk_clam_log_", dir=ROOT)
@@ -387,6 +505,8 @@ if __name__ == "__main__":
     test_signature_db_empty_and_rules()
     test_clamav_bridge_parse_and_mock()
     test_clamav_log_not_contaminated()
+    test_classic_trojans()
+    test_signature_db_pack()
     test_modern_threats()
     test_freshclam_summary()
     test_gui_assembly()

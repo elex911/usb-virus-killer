@@ -1,0 +1,71 @@
+{
+  "time": "2026-11-21T11:11:56.689836",
+  "items": [
+    {
+      "kind": "启动项",
+      "hive": "HKLM",
+      "subkey": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "name": "KV2004",
+      "old_value": "C:\\Windows\\microsoft.exe"
+    },
+    {
+      "kind": "启动项",
+      "hive": "HKCU",
+      "subkey": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "name": "WebAuto",
+      "old_value": "C:\\Windows\\System32\\WebAuto.exe"
+    },
+    {
+      "kind": "文件关联",
+      "hive": "HKCR",
+      "subkey": "txtfile\\shell\\open\\command",
+      "name": "",
+      "old_value": "c:\\windows\\winsoft \"%1\"",
+      "new_value": "%SystemRoot%\\system32\\NOTEPAD.EXE %1",
+      "new_type": 2
+    },
+    {
+      "kind": "IFEO劫持",
+      "hive": "HKLM",
+      "subkey": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\evil.exe",
+      "name": "Debugger",
+      "old_value": "C:\\Windows\\evil.dll"
+    }
+  ],
+  "applied": [
+    {
+      "kind": "启动项",
+      "hive": "HKLM",
+      "subkey": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "name": "KV2004",
+      "old_value": "C:\\Windows\\microsoft.exe",
+      "action": "delete_value"
+    },
+    {
+      "kind": "启动项",
+      "hive": "HKCU",
+      "subkey": "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "name": "WebAuto",
+      "old_value": "C:\\Windows\\System32\\WebAuto.exe",
+      "action": "delete_value"
+    },
+    {
+      "kind": "文件关联",
+      "hive": "HKCR",
+      "subkey": "txtfile\\shell\\open\\command",
+      "name": "",
+      "old_value": "c:\\windows\\winsoft \"%1\"",
+      "new_value": "%SystemRoot%\\system32\\NOTEPAD.EXE %1",
+      "new_type": 2,
+      "action": "set_assoc"
+    },
+    {
+      "kind": "IFEO劫持",
+      "hive": "HKLM",
+      "subkey": "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\evil.exe",
+      "name": "Debugger",
+      "old_value": "C:\\Windows\\evil.dll",
+      "action": "delete_value"
+    }
+  ]
+}

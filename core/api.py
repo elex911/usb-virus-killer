@@ -24,7 +24,7 @@ class Action:
     target_mode: str = "required"          # required=必须有目标；optional=可用可不用；none=不需要目标
     danger: bool = False                   # 仅用于界面着色提示，不控制权限
     order: int = 100
-    prompt: str = ""                       # "directory"：执行前先让用户选目录（主线程完成）
+    prompt: str = ""                       # "directory"：先选目录；"file"：先选文件（主线程完成）
     prompt_title: str = ""
 
 

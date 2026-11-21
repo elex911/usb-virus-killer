@@ -29,6 +29,7 @@ from modules import signature_db as sig           # noqa: E402
 from modules import clamav_bridge as cb           # noqa: E402
 from modules import modern_threats as mt          # noqa: E402
 from modules import host_diagnostics as hd        # noqa: E402
+from modules import classic_trojans as ct         # noqa: E402
 import fixtures                                   # noqa: E402
 
 RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
@@ -254,7 +255,56 @@ def s_hostdiag(log):
     return ok, checks, None
 
 
-@case("12 GUI 装配烟测（源码级）")
+@case("13 经典木马体检（真实主机低噪音）")
+def s_classic(log):
+    ct._reset_seams()
+    res = ct.Module().run("detect", Context(), log)
+    rows = res.data.get("rows", [])
+    levels = [r["level"] for r in rows]
+    kinds = {r["kind"] for r in rows}
+    checks = {"rows": len(rows), "high": levels.count("高危"),
+              "watch": levels.count("关注"), "kinds": sorted(kinds),
+              "levels_valid": all(l in ("高危", "关注", "信息") for l in levels)}
+    # 真实主机干净：不得有高危；核心四类必须完成采集
+    # （IFEO 类仅在有 Debugger 时输出，缺省不算失败）
+    core = {"启动项", "文件关联", "hosts", "共享"}
+    ok = checks["levels_valid"] and checks["high"] == 0 and core <= kinds
+    return ok, checks, None
+
+
+@case("14 特征库规则包全链路")
+def s_sigpack(log):
+    tmp = tempfile.mkdtemp(prefix="tb_pack_", dir=RESULTS_DIR)
+    try:
+        db_path = os.path.join(tmp, "signature_db.json")
+        ctx = Context(app_dir=tmp, settings={"signature_db_path": db_path})
+        mod = sig.Module()
+        mod.run("init", ctx, log)
+        rule = {"id": "tb_rule", "type": "filename_regex", "value": r"(?i)^microsoft\.exe$",
+                "source": "百度百科 Trojan/QQMsg.FakeUpdt（T3 登记）",
+                "evidence": "T3", "first_seen": "2004-06-01", "enabled": False}
+        pack = os.path.join(tmp, "pack_v1.json")
+        with io.open(pack, "w", encoding="utf-8") as f:
+            json.dump({"name": "tb-pack", "version": 1, "source": "testbed.local/v1",
+                       "rules": [rule]}, f, ensure_ascii=False)
+        ctx.pick = pack
+        r1 = mod.run("import_pack", ctx, log)
+        ver_after_import = sig.load_db(db_path)["db_version"]
+        ctx.pick = pack
+        r_dup = mod.run("import_pack", ctx, log)
+        r_rb = mod.run("rollback_db", ctx, log)
+        ver_after_rollback = sig.load_db(db_path)["db_version"]
+        checks = {"import_ok": r1.ok, "db_version_after": ver_after_import,
+                  "duplicate_rejected": not r_dup.ok, "rollback_ok": r_rb.ok,
+                  "rollback_version": ver_after_rollback,
+                  "backup_exists": bool(r1.report.get("backup"))}
+        ok = (checks["import_ok"] and checks["db_version_after"] == 1
+              and checks["duplicate_rejected"] and checks["rollback_ok"]
+              and checks["rollback_version"] == 0 and checks["backup_exists"])
+        return ok, checks, tmp
+    finally:
+        pass
+@case("15 GUI 装配烟测（源码级）")
 def s_gui(log):
     import tkinter as tk
     from core.app import App
@@ -283,7 +333,7 @@ def s_gui(log):
             "combobox_count_matches_drives": len(values) == len(drives),
             "hint": hint,
         }
-        ok = (len(app.views) == 5 and author_ok
+        ok = (len(app.views) == 6 and author_ok
               and len(values) == len(set(values)) == len(drives)
               and hint.count("；") == 0)
         return ok, checks, None
