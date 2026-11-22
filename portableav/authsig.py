@@ -275,6 +275,19 @@ def parse_pkcs7(pkcs7: bytes) -> EmbeddedSignature:
     return sig
 
 
+def tail_slack(body: bytes) -> int:
+    """WIN_CERTIFICATE 里 bCertificate 的尾部多余字节数。
+
+    规范只要求 8 字节内对齐；超过 8 字节的残余是 CVE-2013-3900 类
+    「签名表尾部塞载荷」的典型特征。返回 -1 表示无法解析。
+    """
+    try:
+        ci = read_tlv(body, 0)
+    except SigError:
+        return -1
+    return len(body) - ci.end
+
+
 def embedded_signatures(fp, pe: PEInfo) -> List[EmbeddedSignature]:
     """枚举 WIN_CERTIFICATE 链里的所有签名（含双签名的第二条）。"""
     if not pe.has_signature:
@@ -299,12 +312,7 @@ def embedded_signatures(fp, pe: PEInfo) -> List[EmbeddedSignature]:
             sig.revision = rev
             sig.cert_type = ctype
             sig.total_len = dw_len
-            # 尾部载荷检测（CVE-2013-3900 类）：ASN.1 实际长度与 dwLength 差值
-            try:
-                ci = read_tlv(body, 0)
-                slack = len(body) - ci.end
-            except SigError:
-                slack = -1
+            slack = tail_slack(body)
             if slack > 8:
                 sig.error = "签名表尾部存在 %d 字节非 ASN.1 数据" % slack
         out.append(sig)

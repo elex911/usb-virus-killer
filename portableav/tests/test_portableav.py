@@ -398,3 +398,39 @@ def test_notepad_has_no_embedded_signature():
     with open(p, "rb") as f:
         info = pe.parse_header(f)
         assert authsig.embedded_signatures(f, info) == []
+
+
+# ---------------------------------------------- WIN_CERTIFICATE 链与尾部载荷
+
+def _win_cert(body: bytes, rev=0x0200, ctype=2) -> bytes:
+    """构一条 WIN_CERTIFICATE：dwLength 含 8 字节头，且补齐到 8 字节对齐。"""
+    total = 8 + len(body)
+    pad = (8 - total % 8) % 8
+    return (struct.pack("<IHH", total + pad, rev, ctype) + body
+            + b"\x00" * pad)
+
+
+def _pe_with_cert(cert_blob: bytes) -> bytes:
+    data = bytearray(_build_pe32(cert_size=len(cert_blob)))
+    cert_off = 0x700
+    data[cert_off:cert_off + len(cert_blob)] = cert_blob
+    return bytes(data)
+
+
+def test_dual_certificate_chain_enumerated():
+    """双签名文件的两个 WIN_CERTIFICATE 必须都能枚举到（对齐不能错）。"""
+    blob = _win_cert(b"ABCD" * 8) + _win_cert(b"WXYZ" * 4, rev=0x0100)
+    info = pe.parse_header(_MemFile(_pe_with_cert(blob)))
+    sigs = authsig.embedded_signatures(_MemFile(_pe_with_cert(blob)), info)
+    assert len(sigs) == 2
+    assert [s.revision for s in sigs] == [0x0200, 0x0100]
+    # 内容不是合法 PKCS#7，必须报错而不是静默当成「无签名」
+    assert all(s.error for s in sigs)
+
+
+def test_tail_slack_detects_appended_payload():
+    """签名表里 ASN.1 结束之后还塞了 20 字节 → 必须能算出来。"""
+    body = _tlv(0x30, b"abc") + b"\xDE\xAD" * 10
+    assert authsig.tail_slack(body) == 20
+    assert authsig.tail_slack(_tlv(0x30, b"abc")) == 0
+    assert authsig.tail_slack(b"\xFF\xFF\xFF") == -1     # 解析不了 → -1
