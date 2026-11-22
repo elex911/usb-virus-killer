@@ -65,12 +65,14 @@ portableav/
   chain.py     X.509 解析 + PKCS#7 验签（内容摘要/签名/链到受信根/EKU）
   timestamp.py RFC 3161 时间戳令牌验证（证书过期的唯一合法出路）
   catroot.py   目标盘 .cat 索引（先验 .cat 自身签名，再按三种条目形态取哈希）
-  trust.py     判定层：白/灰/黑 分级与放行依据
-  scan.py      【待做】扫描调度（scandir + 线程池 + 单文件大小上限 + 失败计数）
+  trust.py     判定层：白/灰/黑 分级与放行依据；吊销命中即判黑
+  revoke.py    吊销/黑名单加载与链上检查（无名单时明确标注"未启用"）
+  matcher.py   规则匹配：内置 EICAR + 可选 yara-x 适配（缺包不伪装成已扫描）
+  scan.py      扫描调度（scandir + 线程池 + 限额 + 失败分区）
+  quarantine.py加密隔离与还原（keyring 包裹 DEK、原子写、O_EXCL、崩溃恢复）
+  report.py    单文件离线 HTML 报告（内联 CSS，强制含"解析失败"分区与能力边界）
+  cli.py       命令行：env / scan / list / restore / verify
   persist.py   【待做】持久化矩阵（复用 core/offline_registry.py + 任务 XML + 服务/驱动）
-  quarantine.py【待做】加密隔离与一键还原
-  report.py    【待做】单文件离线 HTML 报告
-  cli.py       【待做】命令行入口与交互
 ```
 
 **分层原则**：采集层（env/drives/paths/persist）只读；判定层（authsig/catroot/trust）不算分只给依据；
@@ -112,21 +114,21 @@ portableav/
 
 | 阶段 | 内容 | 验收证据 |
 |---|---|---|
-| **V0.1（本轮）** | 路径翻译 / 环境识别 / 离线盘定位 / PE 解析 / Authenticode 摘要与内嵌签名 | `portableav/tests` 40 用例；真实文件「签名内摘要 == 自算摘要」；PE 头与 pefile 逐字段一致 |
-| **V0.2（本轮）** | 证书链验签、RFC3161 时间戳、`.cat` 索引（先验自身签名）、判定层白/灰/黑 | 合成 CA 链 8 例（含伪造被拒）；真实 1453 个编录 1442 验签通过、96135 条哈希、3.78s；notepad 双摘要命中；伪造编录不产生白名单 |
-| V0.3 | 扫描调度（线程池、大小上限、失败分区）+ 结果分级 | 场景化测试：畸形 PE、超长路径、锁定文件 |
+| **V0.1** | 路径翻译 / 环境识别 / 离线盘定位 / PE 解析 / Authenticode 摘要与内嵌签名 | 真实文件「签名内摘要 == 自算摘要」；PE 头与 pefile 逐字段一致 |
+| **V0.2** | 证书链验签、RFC3161 时间戳、`.cat` 索引（先验自身签名）、判定层白/灰/黑 | 合成 CA 链（含伪造被拒）；真实 1453 个编录 1442 验签通过、96135 条哈希、3.78s；notepad 双摘要命中 |
+| **V0.3（本轮）** | 扫描调度、吊销接线、加密隔离、HTML 报告、CLI、`rules/` 信任资产约定 | 81 用例全绿；端到端演示：EICAR 判黑并隔离、密文无明文、还原 SHA-256 一致、重复还原被拒、畸形 PE 进"解析失败" |
 | V0.4 | 持久化矩阵（复用 offline_registry + 任务 XML + 服务/驱动） | 合成 hive/XML 夹具 + 真实 hive 只看不写 |
-| V0.5 | 加密隔离 + 一键还原 + 单文件 HTML 报告 | 还原后 SHA-256 一致；断电模拟下不产生孤儿 |
 | V0.6 | 绿包构建 + WinPE 实机/虚拟机压测 | X: 空间不下降；EICAR 命中；误报抽样口径 |
 
 ## 9. 未实现 / 未验证（不得当成已完成）
 
-1. **吊销/泄露证书黑名单（disallowedcert）未实现**：目前只做到"链到受信根"，没有做"已吊销即拦"。
-   这是已知缺口——被盗用的合法代码签名证书在当前实现下会被放行。V0.3 补。
+1. **吊销名单本身需要外部数据**：代码已实现"链上任意一级命中即判黑"，但仓库不内置任何名单
+   （`rules/revoked/` 为空）。没有名单时报告会明确写"吊销检查未启用"，不会假装检查过。
 2. `catroot.py` 里"名字型编录"的判定用 ASCII-UTF16 启发式：理论上存在极少数条目被误分类，
    后果是**漏放行**（该文件降为灰）或索引里多一条无法被任何真实文件撞上的假哈希（需原像攻击才可利用）。
-3. YARA / 模型扫描 —— 未接入；本机未安装 `yara-x`。
-4. 加密隔离、报告、CLI —— 未实现（V0.5）。
+3. **YARA 只做了适配层，未装引擎**：本机没有 `yara-x`，当前实际生效的只有内置 EICAR 特征；
+   报告里会写"yara-x 未启用"。不要把"有适配层"当成"有完整规则查杀"。
+4. **没有跨进程锁**：隔离区清单是单进程语义（同机同时开两个扫描进程会互相覆盖清单）。
 5. 绿包构建脚本 —— 未写；规范里的示例脚本有 7 处问题（无 SHA-256、单线程下载、版本不锁、`Disallowed` 存储常空等），不照抄。
 6. **WinPE 实机未验证**：本机无 PE 环境，`env.detect` 只用注入参数验证过逻辑，没有真机证据。
 7. **双签名（SHA-1 + SHA-256）路径无真实样本**：本机 `System32` + `SysWOW64` 共 7191 个可执行文件，双签名样本 **0 个**（Win11 时代基本只剩 SHA-256 单签）。
@@ -146,3 +148,40 @@ portableav/
   整文件 SHA-1/SHA-256 在 1453 个 `.cat` 中命中 0 次。
 - 证书过期不是死路：本机微软编录的叶证书 2026-06-17 到期、中间证书 2026-10-19 到期，
   靠 RFC3161 令牌（genTime 2026-03-01，且 imprint 与签名值一致）证明"签名当时有效"。
+
+## 11. 用法
+
+```bash
+# 0) 先准备离线信任资产（见 rules/README.md），否则签名一律不判白
+#    导出根证书 → portableav/rules/roots/*.cer
+#    吊销名单   → portableav/rules/revoked/*.txt|json
+
+# 1) 看环境与可用的离线系统盘
+python -m portableav env
+
+# 2) 演练扫描（默认不处置），出报告
+python -m portableav scan --target D:\ --report report.html
+
+# 3) 真正处置：必须显式给隔离区 + --apply
+python -m portableav scan --target D:\ \
+    --quarantine E:\PortableAV_Quarantine \
+    --apply --report report.html
+
+# 4) 隔离区运维
+python -m portableav list    --quarantine E:\PortableAV_Quarantine
+python -m portableav verify  --quarantine E:\PortableAV_Quarantine
+python -m portableav restore --quarantine E:\PortableAV_Quarantine --id <隔离ID>
+```
+
+**端到端演示实测**（5 个样本的合成目录，T2）：
+
+| 样本 | 期望 | 实测 |
+|---|---|---|
+| `notepad.exe` 的副本 | 编录白名单 | 白（依据：编录签名） |
+| `kernel32.dll` 的副本 | 内嵌签名白名单 | 白（依据：内嵌签名，链到受信根） |
+| EICAR 测试文件 | 判黑并隔离 | 黑 → 已加密隔离，原路径消失 |
+| `MZ` + 全零的畸形 PE | 进"解析失败"而非"灰" | 解析失败 1，未混入灰名单 |
+| 普通文本 | 待复核 | 灰（非 PE，未做签名判定） |
+
+隔离后核对：密文 96 字节、**不含任何明文片段**；还原后 SHA-256 与隔离前逐字节一致；
+对同一项再次还原被拒绝（`exit 3`）。

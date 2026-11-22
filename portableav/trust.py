@@ -36,6 +36,7 @@ class Verdict:
     digest_sha1: str = ""
     catalog_file: str = ""
     has_embedded: bool = False
+    parse_failed: bool = False                       # True → 必须进「解析失败」分区
 
     @property
     def is_white(self) -> bool:
@@ -53,8 +54,12 @@ def _auth_digests(fp, info) -> tuple:
 
 def judge_pe(path: str, roots: Sequence[chainmod.Cert],
              index: Optional[catroot.CatIndex] = None,
-             now: Optional[_dt.datetime] = None) -> Verdict:
-    """对一个 PE 文件给出判定。任何异常都落成灰，不抛。"""
+             now: Optional[_dt.datetime] = None,
+             revocation=None) -> Verdict:
+    """对一个 PE 文件给出判定。任何异常都落成灰，不抛。
+
+    revocation：revoke.RevocationList；链上任意一级命中即判黑（防盗用签名）。
+    """
     now = now or _dt.datetime.now(_dt.timezone.utc)
     v = Verdict(level=LEVEL_GRAY, path=path)
     try:
@@ -63,6 +68,7 @@ def judge_pe(path: str, roots: Sequence[chainmod.Cert],
                 info = pemod.parse_header(fp)
             except pemod.PEError as exc:
                 v.reasons.append("PE 解析失败：%s" % exc)
+                v.parse_failed = True
                 return v
             except OSError as exc:
                 v.reasons.append("读取失败：%s" % exc)
@@ -98,6 +104,15 @@ def judge_pe(path: str, roots: Sequence[chainmod.Cert],
                     if ok is None:
                         v.reasons.append("无法比对摘要：%s" % detail)
                         continue
+                    # 被盗/被吊销的证书签出来的文件，链能走通也必须拦
+                    if revocation is not None and getattr(revocation, "loaded", False):
+                        hit = revocation.check_chain(res.chain.chain or [])
+                        if hit:
+                            v.level = LEVEL_BLACK
+                            v.basis = "吊销/黑名单证书"
+                            v.signer = res.signer.subject_text if res.signer else ""
+                            v.reasons.append(hit)
+                            return v
                     v.level = LEVEL_WHITE
                     v.basis = WHITE_EMBEDDED
                     v.signer = res.signer.subject_text if res.signer else ""
@@ -136,7 +151,8 @@ def judge_pe(path: str, roots: Sequence[chainmod.Cert],
 
 def judge_any(path: str, roots: Sequence[chainmod.Cert],
               index: Optional[catroot.CatIndex] = None,
-              now: Optional[_dt.datetime] = None) -> Verdict:
+              now: Optional[_dt.datetime] = None,
+              revocation=None) -> Verdict:
     """非 PE 文件不做签名判定，直接灰（留给规则引擎），但会说明原因。"""
     try:
         with open(path, "rb") as fp:
@@ -144,7 +160,7 @@ def judge_any(path: str, roots: Sequence[chainmod.Cert],
     except OSError as exc:
         return Verdict(LEVEL_GRAY, ["读取失败：%s" % exc], path=path)
     if head == b"MZ":
-        return judge_pe(path, roots, index=index, now=now)
+        return judge_pe(path, roots, index=index, now=now, revocation=revocation)
     return Verdict(LEVEL_GRAY, ["非 PE 文件，未做签名判定"], path=path)
 
 

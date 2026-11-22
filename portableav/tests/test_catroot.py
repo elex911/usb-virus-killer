@@ -192,3 +192,51 @@ def test_judge_non_pe_is_gray(tmp_path):
     v = trust.judge_any(p, [])
     assert v.level == trust.LEVEL_GRAY
     assert "非 PE" in " ".join(v.reasons)
+
+
+# ---------------------------------------------------------------- 吊销
+
+def test_revoked_ca_catalog_rejected(tmp_path):
+    """编录签名证书被列入吊销名单 → 该编录不得入索引。"""
+    from portableav import revoke
+
+    ca_key, ca = D.make_cert("Revoked CA", is_ca=True, code_signing=False, serial=201)
+    leaf_key, leaf = D.make_cert("Revoked Publisher", ca, ca_key, serial=202)
+    victim = hashlib.sha256(b"revoked-victim").digest()
+    blob = D.build_pkcs7(D.build_ctl([victim]), D.OID_CTL, leaf, leaf_key)
+    cat_path = _write_cat(str(tmp_path), blob, "revoked.cat")
+
+    rl = revoke.RevocationList(loaded=True)
+    rl.sha1.add(hashlib.sha1(D.cert_der(ca)).hexdigest().upper())
+
+    idx = catroot.build_index([cat_path], [chain.parse_cert(D.cert_der(ca))], revocation=rl)
+    assert idx.files_verified == 0
+    assert idx.lookup(victim) is None
+    assert any("吊销" in r for _n, r in idx.files_rejected)
+
+
+def test_revoked_root_turns_signed_file_black():
+    """签名链里任意一级被吊销 → 该签名文件必须判黑，不能因链通就放行。"""
+    from portableav import revoke
+
+    if not os.path.isfile(KERNEL32) or not ROOTS_DIR or not os.path.isdir(ROOTS_DIR):
+        pytest.skip("缺少真实根证书或系统文件")
+    roots = chain.load_roots_from_dir(ROOTS_DIR)
+    rl = revoke.RevocationList(loaded=True)
+    for c in roots:
+        rl.sha1.add(hashlib.sha1(c.der).hexdigest().upper())
+    v = trust.judge_pe(KERNEL32, roots, index=None, revocation=rl)
+    assert v.level == trust.LEVEL_BLACK, v.summary()
+    assert "吊销" in " ".join(v.reasons)
+
+
+def test_empty_revocation_list_does_not_block_white():
+    """黑名单为空（未加载）时，不得因为"有吊销模块"就把干净文件判黑。"""
+    from portableav import revoke
+
+    if not os.path.isfile(KERNEL32) or not ROOTS_DIR or not os.path.isdir(ROOTS_DIR):
+        pytest.skip("缺少真实根证书或系统文件")
+    roots = chain.load_roots_from_dir(ROOTS_DIR)
+    rl = revoke.RevocationList(loaded=False)
+    v = trust.judge_pe(KERNEL32, roots, index=None, revocation=rl)
+    assert v.level == trust.LEVEL_WHITE

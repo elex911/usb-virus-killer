@@ -239,8 +239,9 @@ def parse_cat(data: bytes) -> Tuple[Set[bytes], Set[bytes], str]:
 
 
 def inspect_cat(path: str, roots: Sequence[chainmod.Cert],
-                now: Optional[_dt.datetime] = None) -> CatFile:
-    """验签 + 提哈希。验签不过 → 哈希为空，绝不入索引。"""
+                now: Optional[_dt.datetime] = None,
+                revocation=None) -> CatFile:
+    """验签 + 提哈希。验签不过或证书被吊销 → 哈希为空，绝不入索引。"""
     cf = CatFile(path=path)
     try:
         with open(path, "rb") as f:
@@ -254,6 +255,13 @@ def inspect_cat(path: str, roots: Sequence[chainmod.Cert],
         cf.verified = False
         cf.reason = "验签未通过：%s" % res.reason
         return cf
+
+    if revocation is not None and getattr(revocation, "loaded", False):
+        hit = revocation.check_chain(res.chain.chain or [])
+        if hit:
+            cf.verified = False
+            cf.reason = "签名证书被吊销：%s" % hit
+            return cf
 
     s1, s256, why = parse_cat(data)
     if why:
@@ -269,7 +277,8 @@ def inspect_cat(path: str, roots: Sequence[chainmod.Cert],
 
 def build_index(cat_files: Iterable[str], roots: Sequence[chainmod.Cert],
                 now: Optional[_dt.datetime] = None,
-                max_reject_samples: int = 5) -> CatIndex:
+                max_reject_samples: int = 5,
+                revocation=None) -> CatIndex:
     idx = CatIndex()
     files = list(cat_files)
     idx.files_total = len(files)
@@ -279,7 +288,7 @@ def build_index(cat_files: Iterable[str], roots: Sequence[chainmod.Cert],
         return idx
 
     for p in files:
-        cf = inspect_cat(p, roots, now=now)
+        cf = inspect_cat(p, roots, now=now, revocation=revocation)
         if cf.verified:
             idx.files_verified += 1
             idx.sha1 |= cf.sha1
