@@ -31,6 +31,15 @@ jobs:
             echo "::error::pytest failed: $(grep -m1 'FAILED' pytest-output.txt || echo 'see job log')"
             exit "$rc"
           fi
+      - name: PortableAV offline engine tests
+        shell: bash
+        run: |
+          python -m pytest portableav/tests/test_portableav.py -q --tb=short 2>&1 | tee pytest-portableav.txt
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::portableav pytest failed: $(grep -m1 'FAILED' pytest-portableav.txt || echo 'see job log')"
+            exit "$rc"
+          fi
       - name: Testbed (20 scenarios, synthetic/EICAR samples only)
         run: python testbed/run_testbed.py
       - name: Static analysis (advisory, non-blocking)
