@@ -404,6 +404,112 @@ def test_compensation_state_machine():
         shutil.rmtree(t5, ignore_errors=True)
 
 
+def test_restore_status_and_atomic_manifest():
+    """补强复审#2：正常回滚后状态写回 + 清单原子写入。
+    覆盖：恢复后逐项 restored 落盘 / 摘要归零 / 重复恢复不误报 /
+          清单写入中途被中断时旧清单仍完整可读、无临时残留。
+    """
+    import unittest.mock as um
+
+    def _sample_usb(base):
+        usb = os.path.join(base, "usb")
+        os.makedirs(usb)
+        made = []
+        for nm in ("照片.jpg", "账单.pdf"):
+            orig = os.path.join(usb, nm)
+            with open(orig, "wb") as f:
+                f.write(nm.encode("utf-8"))
+            fv.set_attr(orig, fv.FILE_ATTRIBUTE_HIDDEN | fv.FILE_ATTRIBUTE_SYSTEM)
+            lnk = os.path.join(usb, nm.rsplit(".", 1)[0] + ".lnk")
+            make_lnk(lnk, orig)
+            made.append(lnk)
+        return usb, made
+
+    # ---- 场景一：恢复后 restored 落盘、摘要归零、重复恢复不误报 ----
+    t1 = tempfile.mkdtemp(prefix="fk_reststate_", dir=ROOT)
+    try:
+        usb, made = _sample_usb(t1)
+        eng = fv.Engine(usb, False)
+        eng.precheck()
+        eng.scan(lambda m: None)
+        r = eng.clean(lambda m: None)
+        qdir = r["quarantine"]
+        assert fv.Engine.restore_summary(qdir)["count"] >= 2, "恢复前摘要应有隔离项"
+        okc, fail = fv.Engine.restore(qdir, lambda m: None)
+        assert okc >= 2 and fail == 0, (okc, fail)
+        for p in made:
+            assert os.path.exists(p), "回滚后原路径应恢复: %s" % p
+        with open(os.path.join(qdir, "manifest.json"), encoding="utf-8") as f:
+            mf = json.load(f)
+        qitems = [i for i in mf["items"] if i.get("action") == "quarantine"]
+        assert qitems and all(i.get("status") == "restored" for i in qitems), \
+            "恢复后每项应标 restored 并持久化: %r" % mf
+        assert fv.Engine.restore_summary(qdir)["count"] == 0, \
+            "恢复后摘要应归零（不得再列已恢复项）"
+        # 重复恢复：restored 项跳过，不因源消失而误报失败
+        okc2, fail2 = fv.Engine.restore(qdir, lambda m: None)
+        assert (okc2, fail2) == (0, 0), "重复恢复应幂等、不误报失败: %r" % ((okc2, fail2),)
+        print("[OK] 回滚状态：restored 逐项落盘 + 摘要归零 + 重复恢复 (0,0)")
+    finally:
+        shutil.rmtree(t1, ignore_errors=True)
+
+    # ---- 场景二：清单原子写入 — 写入中途中断时旧清单完整可读 ----
+    t2 = tempfile.mkdtemp(prefix="fk_atomicmf_", dir=ROOT)
+    try:
+        mf_path = os.path.join(t2, "manifest.json")
+        old = {"schema_version": 2, "root": t2,
+               "items": [{"action": "quarantine", "rel": "old.lnk", "status": "quarantined"}]}
+        fv.Engine._atomic_write_json(mf_path, old)
+        with open(mf_path, encoding="utf-8") as f:
+            assert json.load(f) == old
+
+        def interrupting_dump(obj, f, *a, **kw):
+            f.write('{"half":')          # 写入部分字节后模拟强杀
+            raise KeyboardInterrupt
+
+        with um.patch("json.dump", interrupting_dump):
+            try:
+                fv.Engine._atomic_write_json(mf_path, {"items": [{"rel": "new.lnk"}]})
+            except KeyboardInterrupt:
+                pass
+            else:
+                assert False, "中断应向上传播，不得吞掉"
+        # 旧清单必须仍完整可读
+        with open(mf_path, encoding="utf-8") as f:
+            loaded = json.load(f)
+        assert loaded == old, "写入中断后旧清单应完整保留: %r" % loaded
+        leftovers = [n for n in os.listdir(t2) if n.endswith(".tmp")]
+        assert not leftovers, "中断后不应残留临时清单文件: %r" % leftovers
+        print("[OK] 原子写入：中断后旧清单可读、临时文件已清理")
+    finally:
+        shutil.rmtree(t2, ignore_errors=True)
+
+    # ---- 场景三：搬移成功但标记前中断 — 重入据磁盘状态补标 restored，不误报 ----
+    t3 = tempfile.mkdtemp(prefix="fk_restore_reentry_", dir=ROOT)
+    try:
+        usb = os.path.join(t3, "usb")
+        os.makedirs(usb)
+        qdir = os.path.join(usb, "__WORM_QUARANTINE_reentry")
+        os.makedirs(qdir)
+        # 文件已在原路径（上次搬移成功），但清单仍标 quarantined（标记前中断）
+        dst = os.path.join(usb, "x.lnk")
+        with open(dst, "wb") as f:
+            f.write(b"BACK")
+        mf_path = os.path.join(qdir, "manifest.json")
+        mf = {"schema_version": 2, "root": usb, "items": [
+            {"action": "quarantine", "rel": "x.lnk", "status": "quarantined", "sha256": ""}]}
+        fv.Engine._atomic_write_json(mf_path, mf)
+        okc, fail = fv.Engine.restore(qdir, lambda m: None)
+        assert (okc, fail) == (1, 0), "应补标为已恢复，不得误报失败: %r" % ((okc, fail),)
+        with open(mf_path, encoding="utf-8") as f:
+            mf2 = json.load(f)
+        assert mf2["items"][0]["status"] == "restored", "补标应持久化: %r" % mf2
+        assert fv.Engine.restore_summary(qdir)["count"] == 0
+        print("[OK] 回滚重入：搬移成功但标记前中断 → 据磁盘补标 restored")
+    finally:
+        shutil.rmtree(t3, ignore_errors=True)
+
+
 def test_quarantine_metadata_and_summary():
     """补强1：隔离元数据显示证据级、回滚摘要确认、SHA-256 篡改拒绝。"""
     import unittest.mock as um

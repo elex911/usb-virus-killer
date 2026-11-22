@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 from datetime import datetime
 
 from core.api import Action, ActionResult, Context, ModuleBase
@@ -63,14 +64,16 @@ SCRIPT_EXTS = (".vbs", ".vbe", ".js", ".jse", ".hta", ".scr", ".pif", ".bat", ".
 #   quarantined  确认已搬入隔离区（正常完成态）
 #   compensated  中断补偿后已还原到原路径
 #   conflict     隔离区与原路径同时存在副本 — 保留两份，交人工，绝不覆盖
+#   restored     正常回滚已恢复到原路径（不再计入待回滚摘要）
 #   failed       两份都不在 / 搬移异常 — 留痕告警，不猜测、不伪造
-# 终态（compensated/conflict/failed）不再被补偿重复动作 ⇒ 幂等。
+# 终态（compensated/conflict/failed/restored）不再被补偿重复动作 ⇒ 幂等。
 ST_PENDING = "pending"
 ST_QUARANTINED = "quarantined"
 ST_COMPENSATED = "compensated"
 ST_CONFLICT = "conflict"
 ST_FAILED = "failed"
-_COMPENSATE_TERMINAL = (ST_COMPENSATED, ST_CONFLICT, ST_FAILED)
+ST_RESTORED = "restored"
+_COMPENSATE_TERMINAL = (ST_COMPENSATED, ST_CONFLICT, ST_FAILED, ST_RESTORED)
 
 
 def get_attr(path):
@@ -273,6 +276,28 @@ class Engine:
         return h.hexdigest()
 
     @staticmethod
+    def _atomic_write_json(path, data):
+        """原子写 JSON 清单：同目录临时文件 → flush → fsync → os.replace 替换。
+
+        进程在写入/刷盘中途被强制终止时，目标 manifest.json 仍是上一份完整可读的清单；
+        os.replace 在同一文件系统上是原子操作，避免半截 JSON。异常时清理临时文件。
+        """
+        directory = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(prefix=".manifest_", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
     def _capture_meta(path, item):
         """隔离前取证：SHA-256、大小、时间戳、属性、检测来源（T1 原始量，manifest 为 T2 载体）。"""
         st = os.stat(path)
@@ -384,9 +409,9 @@ class Engine:
                     "time": datetime.now().isoformat(), "root": os.path.abspath(self.root), "items": []}
 
         def _flush():
-            # manifest 逐项落盘：隔离中途崩溃（断电/Ctrl+C）已搬入项仍可回滚
-            with open(os.path.join(qdir, "manifest.json"), "w", encoding="utf-8") as f:
-                json.dump(manifest, f, ensure_ascii=False, indent=2)
+            # manifest 逐项原子落盘：隔离中途崩溃（断电/Ctrl+C）已搬入项仍可回滚，
+            # 且不会因写到一半而留下半截 JSON（原子替换，旧清单始终可读）。
+            Engine._atomic_write_json(os.path.join(qdir, "manifest.json"), manifest)
 
         _flush()
         moved = 0
@@ -476,8 +501,21 @@ class Engine:
             manifest = json.load(f)
         root = manifest.get("root") or os.path.dirname(os.path.dirname(qdir))
         okc = fail = 0
+        dirty = False
+
+        def _flush():
+            # 逐项原子写回：回滚中途中断时，已恢复项标 restored，剩余项仍是 quarantined，
+            # 再次回滚只处理未恢复项；任何时刻清单都完整可读。
+            nonlocal dirty
+            if dirty:
+                Engine._atomic_write_json(mf, manifest)
+                dirty = False
+
         for it in manifest.get("items", []):
             if it.get("action") != "quarantine":
+                continue
+            if it.get("status") == ST_RESTORED:
+                # 已恢复项跳过：重复回滚不因源已消失而误报失败
                 continue
             rel = str(it.get("rel") or "")
             # 危险路径防护：manifest 是隔离区内的可编辑文件，rel 必须是根内的相对路径
@@ -489,8 +527,16 @@ class Engine:
                 continue
             src = os.path.join(qdir, rel)
             dst = os.path.join(root, rel)
-            if not os.path.exists(src):
-                fail += 1
+            src_in, dst_in = os.path.exists(src), os.path.exists(dst)
+            if not src_in:
+                if dst_in:
+                    # 上次搬移成功但标记前中断：据磁盘状态补标 restored，不重复搬、不误报
+                    it["status"] = ST_RESTORED
+                    dirty = True
+                    okc += 1
+                    log("回滚补标（文件已在原路径）：%s" % rel)
+                else:
+                    fail += 1
                 continue
             expected = str(it.get("sha256") or "")
             if len(expected) == 64:
@@ -504,18 +550,23 @@ class Engine:
                     log("回滚拒绝（SHA-256 不符，隔离文件可能被篡改）：%s" % rel)
                     fail += 1
                     continue
-            if os.path.exists(dst):
+            if dst_in:
                 # 不覆盖用户现有文件：宁可该项回滚失败留给人工，也不静默吞掉现状
                 log("回滚跳过（目标已存在，不覆盖）：%s" % dst)
                 fail += 1
                 continue
             try:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
+                # 先搬移成功，再标 restored 并原子落盘：绝不留「标了已恢复但文件还在隔离区」
+                # 的假恢复窗口。若搬移后、标记前被中断，重入时由上面的 dst_in 分支补标。
                 shutil.move(src, dst)
+                it["status"] = ST_RESTORED
+                dirty = True
                 okc += 1
             except Exception as e:
                 log("回滚失败 %s : %s" % (rel, e))
                 fail += 1
+        _flush()  # 收尾兜底：任何剩余脏状态都写回
         log("回滚完成：成功 %d，失败 %d。" % (okc, fail))
         return okc, fail
 
