@@ -2,16 +2,18 @@
 
 依据：TASK.md + 四张贴条（A 检测查杀 / B 架构代码 / C 交互体验 / D 测试与边界）。关键断言已经主管回查源码复核。证据分级沿用 T1=代码原文 / T2=可复算 / T3=推测（已标注）。
 
+> 更新（2026-11-22）：当前内置模块数为 **8**（含 `active_defense`），本地固定磁盘与系统盘默认可查杀。下文「三、发现的冲突」等条目中的「7 模块 / README 缺模块」为当时历史快照，不代表当前状态。
+
 ---
 
 ## 一、功能总结
 
 ### 1. 架构
-- 契约层：Action/ActionResult/Context 三 dataclass + ModuleBase 默认实现，7 个模块全部实现 actions/run/build_view/render/detail 契约，无一破坏（core/api.py:17-96）。
-- 注册表：8 内置模块经 BUILTIN_MODULES 声明式注册；plugins/*.py 动态加载，`_fk_plugin_` 前缀隔离 sys.modules，单模块失败不中断（core/registry.py:19-27, 59-101）。
+- 契约层：Action/ActionResult/Context 三 dataclass + ModuleBase 默认实现，8 个模块全部实现 actions/run/build_view/render/detail 契约，无一破坏（core/api.py:17-96）。
+- 注册表：8 内置模块经 BUILTIN_MODULES 声明式注册；plugins/*.py 动态加载，`_fk_plugin_` 前缀隔离 sys.modules，单模块失败不中断（core/registry.py:19-28, 59-101）。
 - 主程序：自述"只调度不认识业务"（app.py:5-6）；按钮/标签页由模块生成（app.py:87-120）；worker 线程 + queue 120ms 轮询回主线程（app.py:235, 258-293）；报告导出含 v1.x 兼容字段（app.py:296-343）。但存在硬编码例外（见三.3）。
 - 入口：FolderVirusKiller.py 仅 22 行，--restore 直调 Engine.restore（FolderVirusKiller.py:13-16）；根目录 HostDiagnostics.py 为 3 行兼容 shim。
-- 打包：spec 隐藏导入覆盖 7 模块+core 三件（文件夹病毒查杀工具.spec:9）；datas=[] 不捆绑特征库，外部交付，与文档口径自洽。
+- 打包：spec 隐藏导入覆盖 8 模块+core 三件（文件夹病毒查杀工具.spec:9）；datas=[] 不捆绑特征库，外部交付，与文档口径自洽。
 
 ### 2. 检测与查杀
 - 本地特征库：空库起步绝不覆盖（modules/signature_db.py:120-131），当前 0 规则（T2）；规则校验完备（T3 禁启用 :196-197、正则可编译 :183-187）；规则包版本化导入+禁降级+整包拒绝（:623-661）；字节级备份保留 10 份可回滚（:228-246）；扫描只读、跳过 >64MB 与隔离目录（:275-305）。

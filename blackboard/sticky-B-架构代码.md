@@ -8,7 +8,7 @@
 4. `core/widgets.py`：ResultTable 通用表格，tag 着色、双击详情回调（widgets.py:7-66）。空表 set_rows 安全（已实测 `tv.delete()` 空参不抛错，T2）。
 5. `FolderVirusKiller.py`：仅 22 行入口，--restore 直调 Engine.restore（FolderVirusKiller.py:13-16），其余转 core.app。根目录 HostDiagnostics.py 为 3 行兼容 shim（HostDiagnostics.py:3）。
 6. `modules/host_diagnostics.py`：只读采集 collect()（87-236，Run/IFEO/AppInit/Winlogon/服务 DLL），判级纯函数 _level_for_command（74-80）；fixscript 导出全注释 PowerShell 脚本（271-307，305 行 utf-8-sig+CRLF）；红线口径分离（文件头 8-12、build_view caution 341-351）。
-7. 接口一致性：7 个模块全部实现 actions/run/build_view/render/detail 全套（folder_virus.py:349-414、host_diagnostics.py:319-364、amsi_scan.py:122-171、clamav_bridge.py:199-251、signature_db.py:334-423 等），无一破坏契约。classic_trojans 需接缝者已接缝（见下）。
+7. 接口一致性：8 个模块全部实现 actions/run/build_view/render/detail 全套（folder_virus.py:349-414、host_diagnostics.py:319-364、amsi_scan.py:122-171、clamav_bridge.py:199-251、signature_db.py:334-423 等），无一破坏契约。classic_trojans 需接缝者已接缝（见下）。
 
 ## 二、改进建议（按优先级，均已证伪）
 
