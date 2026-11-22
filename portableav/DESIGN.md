@@ -71,8 +71,8 @@ portableav/
   scan.py      扫描调度（scandir + 线程池 + 限额 + 失败分区）
   quarantine.py加密隔离与还原（keyring 包裹 DEK、原子写、O_EXCL、崩溃恢复）
   report.py    单文件离线 HTML 报告（内联 CSS，强制含"解析失败"分区与能力边界）
-  cli.py       命令行：env / scan / list / restore / verify
-  persist.py   【待做】持久化矩阵（复用 core/offline_registry.py + 任务 XML + 服务/驱动）
+  cli.py       命令行：env / scan / persist / list / restore / verify
+  persist.py   持久化矩阵：注册表(复用 core.offline_registry) + 任务 XML + 启动目录，并与扫描结果关联
 ```
 
 **分层原则**：采集层（env/drives/paths/persist）只读；判定层（authsig/catroot/trust）不算分只给依据；
@@ -117,7 +117,7 @@ portableav/
 | **V0.1** | 路径翻译 / 环境识别 / 离线盘定位 / PE 解析 / Authenticode 摘要与内嵌签名 | 真实文件「签名内摘要 == 自算摘要」；PE 头与 pefile 逐字段一致 |
 | **V0.2** | 证书链验签、RFC3161 时间戳、`.cat` 索引（先验自身签名）、判定层白/灰/黑 | 合成 CA 链（含伪造被拒）；真实 1453 个编录 1442 验签通过、96135 条哈希、3.78s；notepad 双摘要命中 |
 | **V0.3（本轮）** | 扫描调度、吊销接线、加密隔离、HTML 报告、CLI、`rules/` 信任资产约定 | 81 用例全绿；端到端演示：EICAR 判黑并隔离、密文无明文、还原 SHA-256 一致、重复还原被拒、畸形 PE 进"解析失败" |
-| V0.4 | 持久化矩阵（复用 offline_registry + 任务 XML + 服务/驱动） | 合成 hive/XML 夹具 + 真实 hive 只看不写 |
+| **V0.4（本轮）** | 持久化矩阵：注册表（复用已验证的 `core/offline_registry`）+ 计划任务 XML + 启动目录，并与扫描结果按路径关联 | 90 用例全绿；本机真实任务 **228 条、0 解析错误**；合成夹具覆盖"两个 Exec / 无动作 / 坏 XML"；报告第 5 节显示 `LinkedToEicar` 为「确证恶意」、其余「未关联」 |
 | V0.6 | 绿包构建 + WinPE 实机/虚拟机压测 | X: 空间不下降；EICAR 命中；误报抽样口径 |
 
 ## 9. 未实现 / 未验证（不得当成已完成）
@@ -171,6 +171,9 @@ python -m portableav scan --target D:\ \
 python -m portableav list    --quarantine E:\PortableAV_Quarantine
 python -m portableav verify  --quarantine E:\PortableAV_Quarantine
 python -m portableav restore --quarantine E:\PortableAV_Quarantine --id <隔离ID>
+
+# 5) 只看持久化矩阵（不扫描）
+python -m portableav persist --windows D:\Windows
 ```
 
 **端到端演示实测**（5 个样本的合成目录，T2）：
@@ -185,3 +188,15 @@ python -m portableav restore --quarantine E:\PortableAV_Quarantine --id <隔离I
 
 隔离后核对：密文 96 字节、**不含任何明文片段**；还原后 SHA-256 与隔离前逐字节一致；
 对同一项再次还原被拒绝（`exit 3`）。
+
+**持久化联动实测**（合成 Windows 目录）：
+
+| 条目 | 目标 | 报告里的判定 |
+|---|---|---|
+| `Tasks\LinkedToEicar` | `<target>\Users\Public\evil.exe` | **确证恶意**（该文件被 EICAR 规则命中） |
+| `Tasks\EvilTask` | `C:\Users\Public\evil.exe` | 未关联（目标不在本次扫描范围，标注 ✗不存在） |
+| `Tasks\EvilTask` | `%SystemRoot%\System32\cmd.exe` → `C:\Windows\System32\cmd.exe` | 未关联（✓存在） |
+| `Tasks\EmptyTask` | — | 未关联（已标注"没有 Exec 动作"） |
+| `Startup\run.lnk` | 实际路径 | 待复核（非 PE，未做签名判定） |
+
+本机真实环境另有验证：`C:\Windows\System32\Tasks` 下 **228 条任务、0 解析错误**。

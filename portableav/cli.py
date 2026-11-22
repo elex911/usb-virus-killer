@@ -72,6 +72,15 @@ def _infer_cat_dir(target: str) -> str:
     return ""
 
 
+def _infer_windows_dir(target: str) -> str:
+    """按目标推断 Windows 目录（用于持久化矩阵）。找不到返回空串。"""
+    t = os.path.normpath(os.path.abspath(target))
+    for c in (t, os.path.join(t, "Windows"), os.path.dirname(t)):
+        if c and os.path.isdir(os.path.join(c, "System32", "config")):
+            return os.path.normpath(c)
+    return ""
+
+
 def cmd_scan(args) -> int:
     e = envmod.detect()
     target = args.target
@@ -151,14 +160,68 @@ def cmd_scan(args) -> int:
     for r in [x for x in summ.results if x.level == "黑"][:20]:
         print("  [黑] %s  %s  %s" % (",".join(r.rules) or r.basis, r.action, r.path))
 
+    # 持久化矩阵（默认根据目标是否像 Windows 目录自动决定）
+    persist_items, persist_errors = [], []
+    win_dir = _infer_windows_dir(target)
+    want_persist = (args.persist == "on") or (args.persist == "auto" and bool(win_dir))
+    if want_persist:
+        if not win_dir:
+            print("  ！未找到 Windows 目录，跳过持久化矩阵")
+        else:
+            from . import persist as persistmod
+
+            ps = persistmod.collect(win_dir, e.system_drive or "")
+            linked = persistmod.link(ps.items, persistmod.index_results(summ.results))
+            persist_items, persist_errors = ps.items, ps.errors
+            print("持久化矩阵：%d 条（注册表 %d / 任务文件 %d / 启动目录 %d），"
+                  "其中 %d 条能对上本次扫描结果"
+                  % (len(ps.items), ps.registry_rows, ps.task_files,
+                     ps.startup_items, linked))
+            hot = [i for i in ps.items if i.level == "黑"]
+            for i in hot[:10]:
+                print("  [持久化-黑] %s → %s" % (i.source, i.target or i.raw))
+            if ps.errors:
+                print("  持久化解析问题 %d 条（详见报告）" % len(ps.errors))
+
     if args.report:
         qitems = qm.list_items() if qm else []
         out = reportmod.generate(args.report, summ, index=index, revocation=rl,
                                  meta={"mode": e.hint, "max_file_mb": args.limit_mb,
                                        "max_depth": args.max_depth,
                                        "workers": "自动",
-                                       "quarantine_items": qitems})
+                                       "quarantine_items": qitems,
+                                       "persistence_items": persist_items,
+                                       "persist_errors": persist_errors})
         print("报告：%s" % out)
+    return 0
+
+
+def cmd_persist(args) -> int:
+    from . import persist as persistmod
+
+    win = args.windows or _infer_windows_dir(args.target or "")
+    if not win:
+        print("错误：未能定位 Windows 目录，请用 --windows 指定（如 D:\\Windows）")
+        return 2
+    e = envmod.detect()
+    ps = persistmod.collect(win, e.system_drive or "",
+                            do_registry=not args.no_registry,
+                            do_tasks=not args.no_tasks,
+                            do_startup=not args.no_startup)
+    print("Windows 目录：%s" % win)
+    print("持久化条目：%d（注册表 %d / 任务文件 %d / 启动目录 %d）"
+          % (len(ps.items), ps.registry_rows, ps.task_files, ps.startup_items))
+    for it in ps.items[:args.limit]:
+        flag = "" if it.exists is None else ("✓" if it.exists else "✗不存在")
+        print("  [%-8s] %-44s %-30s %s %s"
+              % (it.kind, (it.source or "")[:44], (it.name or "")[:30],
+                 it.target or it.raw or "-", flag))
+    if len(ps.items) > args.limit:
+        print("  …… 其余 %d 条未显示（用 --limit 调整）" % (len(ps.items) - args.limit))
+    if ps.errors:
+        print("解析问题 %d 条：" % len(ps.errors))
+        for x in ps.errors[:10]:
+            print("  - %s" % x)
     return 0
 
 
@@ -222,8 +285,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit-mb", type=int, default=100, help="单文件上限 MB")
     s.add_argument("--max-depth", type=int, default=12)
     s.add_argument("--max-files", type=int, default=0)
+    s.add_argument("--persist", choices=["auto", "on", "off"], default="auto",
+                   help="持久化矩阵（auto=目标像 Windows 目录时才做）")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_scan)
+
+    p2 = sub.add_parser("persist", help="只列持久化矩阵（不扫描）")
+    p2.add_argument("--windows", default="", help="Windows 目录，如 D:\\Windows")
+    p2.add_argument("--target", default="", help="也可给盘根/任意子目录，自动推断")
+    p2.add_argument("--limit", type=int, default=60)
+    p2.add_argument("--no-registry", action="store_true")
+    p2.add_argument("--no-tasks", action="store_true")
+    p2.add_argument("--no-startup", action="store_true")
+    p2.set_defaults(func=cmd_persist)
 
     l = sub.add_parser("list", help="列出隔离区")
     l.add_argument("--quarantine", required=True)

@@ -84,6 +84,23 @@ def generate(path: str, summary, index=None, revocation=None,
             return _e(getattr(it, "created", ""))
         if col == "id":
             return '<span class="mono">%s</span>' % _e(getattr(it, "id", ""))
+        if col == "psource":
+            return _e(getattr(it, "source", "") or "-")
+        if col == "pname":
+            return _e(getattr(it, "name", "") or "-")
+        if col == "praw":
+            raw = getattr(it, "raw", "") or ""
+            return '<span class="mono">%s</span>' % _e(raw[:160] or "-")
+        if col == "ptarget":
+            tgt = getattr(it, "target", "") or ""
+            exists = getattr(it, "exists", None)
+            mark = "" if exists is None else (" ✓" if exists else " ✗不存在")
+            return '<span class="mono">%s</span>%s' % (_e(tgt or "-"), _e(mark))
+        if col == "plevel":
+            lv = getattr(it, "level", "")
+            if not lv:
+                return '<span class="badge warn">未关联</span>'
+            return _badge(lv)
         return _e(str(getattr(it, col, "-")))
 
     wl = index.summary() if index is not None else "未建立编录索引"
@@ -165,11 +182,15 @@ ul{margin:6px 0 0 18px}
 <thead><tr><th>错误</th><th>文件</th></tr></thead>
 <tbody>%(rows_err)s</tbody></table></div></div>
 
-<div class="panel"><h2>5. 隔离区清单（%(n_q)d）</h2><div class="body"><table>
+<div class="panel"><h2>5. 持久化矩阵（%(n_p)d）—— 与扫描结果的关联</h2><div class="body"><table>
+<thead><tr><th>关联</th><th>来源</th><th>名称</th><th>命令</th><th>解析到的目标</th></tr></thead>
+<tbody>%(rows_p)s</tbody></table>%(perr)s</div></div>
+
+<div class="panel"><h2>6. 隔离区清单（%(n_q)d）</h2><div class="body"><table>
 <thead><tr><th>ID</th><th>状态</th><th>时间</th><th>原路径</th><th>SHA-256</th></tr></thead>
 <tbody>%(rows_q)s</tbody></table></div></div>
 
-<div class="panel"><h2>6. 扫描参数</h2><div class="body"><table>
+<div class="panel"><h2>7. 扫描参数</h2><div class="body"><table>
 <tr><th>单文件上限</th><td>%(lim_size)s</td></tr>
 <tr><th>最大深度</th><td>%(lim_depth)s</td></tr>
 <tr><th>线程</th><td>%(workers)s</td></tr>
@@ -196,6 +217,12 @@ ul{margin:6px 0 0 18px}
         "rows_err": _rows(errors, ["error", "path"], cell),
         "rows_q": _rows(q_items, ["id", "status", "created", "original", "sha256"], cell),
         "n_q": len(q_items),
+        "rows_p": _rows(meta.get("persistence_items") or [],
+                        ["plevel", "psource", "pname", "praw", "ptarget"], cell),
+        "n_p": len(meta.get("persistence_items") or []),
+        "perr": ("<div class=\"notice\" style=\"margin:10px 14px\">持久化解析问题：%s</div>"
+                 % "<br>".join(_e(x) for x in (meta.get("persist_errors") or [])[:20]))
+                if meta.get("persist_errors") else "",
         "max": MAX_ROWS,
         "lim_size": "%d MB" % (meta.get("max_file_mb", 100)),
         "lim_depth": _e(meta.get("max_depth", "-")),
