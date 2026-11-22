@@ -17,6 +17,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+pytest.importorskip("cryptography", reason="造证书需要 cryptography")
+
 import _der as D
 from portableav import authsig, catroot, chain, pe, trust
 
