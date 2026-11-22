@@ -717,6 +717,8 @@ def test_clamav_log_not_contaminated():
                     "----------- SCAN SUMMARY -----------\nInfected files: 1\n")
 
         original = cb._run_process
+        original_find = cb.find_clamscan
+        cb.find_clamscan = lambda c: os.path.join(tmp, "clamscan.exe")  # CI 无真实引擎时仍可测桥接逻辑
         cb._run_process = lambda cmd, timeout: (0, "", "")  # 本次扫描无输出无命中
         try:
             ctx = Context(app_dir=tmp)
@@ -730,6 +732,7 @@ def test_clamav_log_not_contaminated():
             print("[OK] ClamAV 日志隔离: 旧扫描命中不再污染本次统计")
         finally:
             cb._run_process = original
+            cb.find_clamscan = original_find
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -739,6 +742,8 @@ def test_clamav_partial_error():
     tmp = tempfile.mkdtemp(prefix="fk_clam_perr_", dir=ROOT)
     try:
         original = cb._run_process
+        original_find = cb.find_clamscan
+        cb.find_clamscan = lambda c: os.path.join(tmp, "clamscan.exe")  # CI 无真实引擎时仍可测 rc=2 分支
 
         def fake_run(cmd, timeout):
             if not any("--recursive" in c for c in cmd):
@@ -762,6 +767,7 @@ def test_clamav_partial_error():
             print("[OK] ClamAV rc=2: 保留命中结果并明示扫描不完整")
         finally:
             cb._run_process = original
+            cb.find_clamscan = original_find
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
