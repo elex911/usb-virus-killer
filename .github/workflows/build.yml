@@ -25,7 +25,7 @@ jobs:
       - name: Unit & integration tests
         shell: bash
         run: |
-          python -m pytest tests/test_modular.py -q --tb=short 2>&1 | tee pytest-output.txt
+          python -m pytest tests -q --tb=short 2>&1 | tee pytest-output.txt
           rc=${PIPESTATUS[0]}
           if [ "$rc" -ne 0 ]; then
             echo "::error::pytest failed: $(grep -m1 'FAILED' pytest-output.txt || echo 'see job log')"
