@@ -33,3 +33,6 @@ testbed/results/
 
 # pytest 临时目录兜底
 fk_*/
+
+# 验收过程临时输出（非交付物，避免旧快照造成文档漂移）
+acc_*.txt

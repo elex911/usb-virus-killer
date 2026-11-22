@@ -229,13 +229,179 @@ def test_restore_safety():
         with open(mf2p, encoding="utf-8") as f:
             mf2 = json.load(f)
         done = [i for i in mf2["items"] if i.get("action") == "quarantine"]
-        assert len(done) == 1, "第 1 项已搬入隔离区但清单未记录: %r" % mf2
-        assert all(i.get("status") == "compensated" for i in done), "中断后应补偿回滚，不留孤儿项: %r" % mf2
-        assert os.path.exists(targets[0]), "第 1 项补偿后应回到原路径"
-        assert not os.path.exists(os.path.join(qdirs[0], os.path.basename(targets[0]))), "隔离区不应残留孤儿"
-        print("[OK] clean 中途中断：逐项落盘 + 补偿回滚，无孤儿")
+        # 契约升级（复审#1）：搬移前先登记 pending 并落盘，因此「正在搬移就被中断」的
+        # 第 2 项也必须出现在清单里，否则补偿看不到它＝孤儿。旧实现 append 在 move 之后，
+        # 这里只会有 1 项——不再是期望行为，不得迁就。
+        assert len(done) == 2, "中断项必须已入清单（pending），不得成为清单外孤儿: %r" % mf2
+        assert all(i.get("status") == "compensated" for i in done), "中断后全部项状态应统一为 compensated: %r" % mf2
+        for t in targets:
+            assert os.path.exists(t), "补偿后所有项都应回到原路径: %s" % t
+        assert not os.listdir(qdirs[0]) or all(
+            os.path.basename(p) in ("manifest.json",) for p in
+            [os.path.join(qdirs[0], n) for n in os.listdir(qdirs[0])]
+        ), "隔离区不应残留被隔离文件（manifest 取证保留除外）"
+        print("[OK] clean 中途中断：搬移前入清单 + 幂等补偿，状态统一无孤儿")
     finally:
         shutil.rmtree(tmp2, ignore_errors=True)
+
+
+def test_compensation_state_machine():
+    """补强复审#1：隔离补偿幂等状态机。
+    覆盖：双份共存保留副本 / 补偿幂等 / 跨卷 EXDEV 降级 / 部分失败后状态统一。
+    """
+    import errno as _errno
+    import unittest.mock as um
+
+    def _mkmanifest(root):
+        return {"schema_version": 3, "tool": "usb-virus-killer v2.1",
+                "time": "test", "root": os.path.abspath(root), "items": []}
+
+    # ---- 场景一：源与目标同时存在 — 保留两份副本，绝不覆盖，状态统一为 conflict ----
+    t1 = tempfile.mkdtemp(prefix="fk_conflict_", dir=ROOT)
+    try:
+        usb = os.path.join(t1, "usb")
+        os.makedirs(usb)
+        qdir = os.path.join(usb, "__WORM_QUARANTINE_conflict")
+        os.makedirs(os.path.join(qdir, "sub"))
+        qfile = os.path.join(qdir, "sub", "x.lnk")
+        with open(qfile, "wb") as f:
+            f.write(b"QUARANTINED")
+        ofile = os.path.join(usb, "sub", "x.lnk")
+        os.makedirs(os.path.dirname(ofile))
+        with open(ofile, "wb") as f:
+            f.write(b"ORIGINAL-NEW")
+        mf = _mkmanifest(usb)
+        mf["items"].append({"action": "quarantine", "rel": os.path.join("sub", "x.lnk"),
+                            "status": "pending", "sha256": fv.Engine._sha256_file(qfile)})
+        logs = []
+        fv.Engine.compensate(mf, qdir, lambda m: logs.append(m))
+        it = mf["items"][0]
+        assert it["status"] == "conflict", "双份存在应标记 conflict，不擅自覆盖: %r" % it
+        with open(ofile, "rb") as f:
+            assert f.read() == b"ORIGINAL-NEW", "目标已有文件不得被隔离副本覆盖"
+        with open(qfile, "rb") as f:
+            assert f.read() == b"QUARANTINED", "隔离副本不得丢失"
+        print("[OK] 双份共存：保留两副本 + status=conflict")
+    finally:
+        shutil.rmtree(t1, ignore_errors=True)
+
+    # ---- 场景二：仅隔离区有副本 — 补偿还原；重复调用幂等 ----
+    t2 = tempfile.mkdtemp(prefix="fk_idem_", dir=ROOT)
+    try:
+        usb = os.path.join(t2, "usb")
+        os.makedirs(usb)
+        qdir = os.path.join(usb, "__WORM_QUARANTINE_idem")
+        os.makedirs(qdir)
+        qfile = os.path.join(qdir, "y.lnk")
+        with open(qfile, "wb") as f:
+            f.write(b"PAYLOAD")
+        ofile = os.path.join(usb, "y.lnk")
+        mf = _mkmanifest(usb)
+        mf["items"].append({"action": "quarantine", "rel": "y.lnk",
+                            "status": "quarantined", "sha256": fv.Engine._sha256_file(qfile)})
+        fv.Engine.compensate(mf, qdir, lambda m: None)
+        assert mf["items"][0]["status"] == "compensated", mf
+        assert os.path.exists(ofile) and not os.path.exists(qfile), "应搬到原路径且隔离副本不再残留"
+        fv.Engine.compensate(mf, qdir, lambda m: None)
+        assert mf["items"][0]["status"] == "compensated", "重复补偿不得翻转状态"
+        assert os.path.exists(ofile), "重复补偿不得搬走已还原文件"
+        print("[OK] 补偿幂等：重复调用状态稳定")
+    finally:
+        shutil.rmtree(t2, ignore_errors=True)
+
+    # ---- 场景三：跨卷 os.rename 抛 EXDEV — 降级 copy2+校验+删源 ----
+    t3 = tempfile.mkdtemp(prefix="fk_exdev_", dir=ROOT)
+    try:
+        usb = os.path.join(t3, "usb")
+        os.makedirs(usb)
+        qdir = os.path.join(usb, "__WORM_QUARANTINE_exdev")
+        os.makedirs(qdir)
+        qfile = os.path.join(qdir, "z.lnk")
+        with open(qfile, "wb") as f:
+            f.write(b"CROSSVOL")
+        ofile = os.path.join(usb, "z.lnk")
+
+        def exdev_rename(src, dst):
+            e = OSError("cross-device link")
+            e.errno = _errno.EXDEV
+            raise e
+
+        with um.patch("os.rename", exdev_rename):
+            fv.Engine._move_back(qfile, ofile, log=lambda m: None)
+        with open(ofile, "rb") as f:
+            assert f.read() == b"CROSSVOL", "跨卷降级应完整复制"
+        assert not os.path.exists(qfile), "跨卷降级校验通过后应删除隔离副本"
+        print("[OK] 跨卷 EXDEV：降级 copy2+校验+删源")
+    finally:
+        shutil.rmtree(t3, ignore_errors=True)
+
+    # ---- 场景四：部分失败后清单状态统一 — compensated/conflict/failed，无残留 quarantined ----
+    t4 = tempfile.mkdtemp(prefix="fk_unify_", dir=ROOT)
+    try:
+        usb = os.path.join(t4, "usb")
+        os.makedirs(usb)
+        qdir = os.path.join(usb, "__WORM_QUARANTINE_unify")
+        os.makedirs(os.path.join(qdir, "d"))
+        with open(os.path.join(qdir, "a.lnk"), "wb") as f:
+            f.write(b"A")
+        with open(os.path.join(usb, "b.lnk"), "wb") as f:
+            f.write(b"B-ORIG")
+        with open(os.path.join(qdir, "b.lnk"), "wb") as f:
+            f.write(b"B-Q")
+        mf = _mkmanifest(usb)
+        for rel in ("a.lnk", "b.lnk", "c.lnk"):
+            mf["items"].append({"action": "quarantine", "rel": rel,
+                                "status": "quarantined", "sha256": ""})
+        fv.Engine.compensate(mf, qdir, lambda m: None)
+        states = {i["rel"]: i["status"] for i in mf["items"]}
+        assert states["a.lnk"] == "compensated", states
+        assert states["b.lnk"] == "conflict", states
+        assert states["c.lnk"] == "failed", states
+        assert all(i["status"] != "quarantined" for i in mf["items"]), \
+            "部分失败后不得残留 quarantined（否则摘要/回滚口径错乱）: %r" % states
+        print("[OK] 清单状态统一：compensated/conflict/failed，无残留 quarantined")
+    finally:
+        shutil.rmtree(t4, ignore_errors=True)
+
+    # ---- 场景五：搬移抛普通异常（非中断）— 失败项当次即收敛，不留 pending ----
+    t5 = tempfile.mkdtemp(prefix="fk_failsettle_", dir=ROOT)
+    try:
+        usb = os.path.join(t5, "usb")
+        os.makedirs(usb)
+        orig = os.path.join(usb, "原图.jpg")
+        with open(orig, "wb") as f:
+            f.write(b"KEEP")
+        fv.set_attr(orig, fv.FILE_ATTRIBUTE_HIDDEN | fv.FILE_ATTRIBUTE_SYSTEM)
+        lnk = os.path.join(usb, "原图.lnk")
+        make_lnk(lnk, orig)
+        auto = os.path.join(usb, "autorun.inf")
+        with open(auto, "w", encoding="utf-8") as f:
+            f.write("[autorun]\nopen=x.exe\n")
+        eng = fv.Engine(usb, False)
+        eng.precheck()
+        eng.scan(lambda m: None)
+        real_move = shutil.move
+        calls = {"n": 0}
+
+        def fail_second(src, dst, *a, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("注入的普通搬移失败")  # 非 KeyboardInterrupt
+            return real_move(src, dst, *a, **kw)
+
+        with um.patch("shutil.move", fail_second):
+            eng.clean(lambda m: None)  # 普通异常被吞，clean 正常返回
+        qdirs = [os.path.join(usb, n) for n in os.listdir(usb)
+                 if n.startswith("__WORM_QUARANTINE_")]
+        assert len(qdirs) == 1, qdirs
+        with open(os.path.join(qdirs[0], "manifest.json"), encoding="utf-8") as f:
+            mf5 = json.load(f)
+        states = [i.get("status") for i in mf5["items"] if i.get("action") == "quarantine"]
+        assert "pending" not in states, "普通失败后仍有 pending（清单状态不统一）: %r" % states
+        assert all(s in ("quarantined", "compensated", "conflict", "failed") for s in states), states
+        print("[OK] 普通搬移失败：失败项当次收敛，清单无 pending")
+    finally:
+        shutil.rmtree(t5, ignore_errors=True)
 
 
 def test_quarantine_metadata_and_summary():

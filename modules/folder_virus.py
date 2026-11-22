@@ -58,6 +58,20 @@ VIRUS_NAME_RE = re.compile(
 )
 SCRIPT_EXTS = (".vbs", ".vbe", ".js", ".jse", ".hta", ".scr", ".pif", ".bat", ".cmd")
 
+# 隔离项状态机（补强复审#1：幂等补偿）
+#   pending      搬移前登记，已落盘但尚不知是否已搬走
+#   quarantined  确认已搬入隔离区（正常完成态）
+#   compensated  中断补偿后已还原到原路径
+#   conflict     隔离区与原路径同时存在副本 — 保留两份，交人工，绝不覆盖
+#   failed       两份都不在 / 搬移异常 — 留痕告警，不猜测、不伪造
+# 终态（compensated/conflict/failed）不再被补偿重复动作 ⇒ 幂等。
+ST_PENDING = "pending"
+ST_QUARANTINED = "quarantined"
+ST_COMPENSATED = "compensated"
+ST_CONFLICT = "conflict"
+ST_FAILED = "failed"
+_COMPENSATE_TERMINAL = (ST_COMPENSATED, ST_CONFLICT, ST_FAILED)
+
 
 def get_attr(path):
     if k32 is None:
@@ -271,8 +285,95 @@ class Engine:
             "attrs": get_attr(path),
             "detection": item.get("reason") or item.get("verdict") or "",
             "original_path": os.path.abspath(path),
-            "status": "quarantined",
+            # 搬移前取证即登记 pending：搬走后才落 quarantined。中断时可据磁盘真实状态收敛。
+            "status": ST_PENDING,
         }
+
+    @staticmethod
+    def _move_back(src, dst, log):
+        """把隔离副本搬回原路径。同卷 os.rename 原子搬移；跨卷降级 copy2+SHA256 校验后删源。
+
+        校验不符时保留两份副本并抛错（绝不删源、绝不覆盖目标）。
+        不使用 shutil.move —— 它与 clean 搬移同源，测试注入/异常语义应彼此独立。
+        """
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        try:
+            os.rename(src, dst)
+            return "renamed"
+        except OSError as e:
+            import errno as _errno
+            is_cross = (getattr(e, "errno", None) == _errno.EXDEV
+                        or getattr(e, "winerror", None) == 17  # ERROR_NOT_SAME_DEVICE
+                        or e.errno == 18)
+            if not is_cross:
+                raise
+        # 跨卷：复制 → 校验 → 删源；任一环节失败保留两份副本
+        shutil.copy2(src, dst)
+        if Engine._sha256_file(src).lower() != Engine._sha256_file(dst).lower():
+            raise OSError("跨卷复制 SHA-256 校验不符，已保留两份副本，请人工核对")
+        os.remove(src)
+        return "copied"
+
+    @staticmethod
+    def _reconcile_one(entry, qdir, root, log):
+        """幂等收敛单个隔离项到终态：只据磁盘真实状态，不依赖『以为搬没搬成功』。
+
+        中断补偿与普通搬移失败共用此原语，保证清单状态统一（不留 pending）。
+        - 终态项（compensated/conflict/failed）跳过 ⇒ 重复调用结果一致。
+        - 仅隔离副本在 → 搬回原路径，标 compensated。
+        - 原路径副本在、隔离副本不在 → 视为已还原，标 compensated。
+        - 两份都在 → 保留两份、覆盖禁止，标 conflict。
+        - 两份都不在 → 标 failed 并告警（数据可能丢失，绝不伪造成功）。
+        有 SHA-256 且不符时拒绝搬回，保留副本标 failed；无则按存在性收敛。
+        """
+        st = entry.get("status")
+        if st in _COMPENSATE_TERMINAL:
+            return st
+        rel = str(entry.get("rel") or "")
+        norm = os.path.normpath(rel) if rel else ""
+        if (not norm or norm.startswith("..") or os.path.isabs(norm)
+                or (len(norm) >= 2 and norm[1] == ":")):
+            entry["status"] = ST_FAILED
+            log("补偿拒绝可疑路径（穿越/绝对路径）：%r" % rel)
+            return ST_FAILED
+        src = os.path.join(qdir, rel)
+        dst = os.path.join(root, rel)
+        src_in, dst_in = os.path.exists(src), os.path.exists(dst)
+        try:
+            if src_in and dst_in:
+                entry["status"] = ST_CONFLICT
+                log("补偿保留两份副本（目标已存在，不覆盖）：%s" % rel)
+            elif src_in and not dst_in:
+                expected = str(entry.get("sha256") or "")
+                if len(expected) == 64 and Engine._sha256_file(src).lower() != expected.lower():
+                    entry["status"] = ST_FAILED
+                    log("补偿拒绝（SHA-256 不符，隔离副本疑似篡改）：%s" % rel)
+                else:
+                    Engine._move_back(src, dst, log=log)
+                    entry["status"] = ST_COMPENSATED
+                    log("补偿已还原：%s" % rel)
+            elif dst_in and not src_in:
+                # 源已不在隔离区、目标在原路径：已还原（含上次补偿中断后重入）
+                entry["status"] = ST_COMPENSATED
+            else:
+                entry["status"] = ST_FAILED
+                log("补偿告警：隔离副本与原路径均不存在：%s" % rel)
+        except Exception as e:
+            entry["status"] = ST_FAILED
+            log("补偿失败 %s : %s" % (rel, e))
+        return entry["status"]
+
+    @staticmethod
+    def compensate(manifest, qdir, log):
+        """对整个清单做幂等补偿：逐项收敛到终态；终态项跳过，重复调用结果一致。"""
+        root = manifest.get("root") or os.path.dirname(os.path.dirname(qdir))
+        counts = {ST_COMPENSATED: 0, ST_CONFLICT: 0, ST_FAILED: 0}
+        for entry in manifest.get("items", []):
+            if entry.get("action") != "quarantine":
+                continue
+            st = Engine._reconcile_one(entry, qdir, root, log)
+            counts[st] = counts.get(st, 0) + 1
+        return counts
 
     def clean(self, log, do_restore_attrs=True):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -300,31 +401,30 @@ class Engine:
                 try:
                     entry.update(Engine._capture_meta(p, it))  # 必须在移动前取证
                     os.makedirs(os.path.dirname(dest), exist_ok=True)
-                    shutil.move(p, dest)
+                    # 关键：搬移『前』登记为 pending 并落盘，保证中断发生在搬移中途时，
+                    # 该项仍在清单内（补偿可见），绝不产生清单外孤儿。
                     manifest["items"].append(entry)
+                    _flush()
+                    shutil.move(p, dest)
+                    entry["status"] = ST_QUARANTINED  # 搬移成功后才确认完成态
                     moved += 1
                     _flush()
                 except (KeyboardInterrupt, SystemExit):
-                    raise  # 中断向上传播，由外层补偿
+                    raise  # 中断向上传播，由外层按磁盘真实状态幂等补偿
                 except Exception as e:
-                    log("隔离失败 %s : %s" % (p, e))
+                    # 搬移抛异常但文件可能已移动：立即对当前项据磁盘状态收敛，
+                    # 绝不留下 pending（否则部分失败后清单状态不统一、回滚口径错乱）
+                    log("隔离失败 %s : %s（已按磁盘状态收敛该项）" % (p, e))
+                    Engine._reconcile_one(entry, qdir, manifest["root"], log)
+                    _flush()
         except (KeyboardInterrupt, SystemExit):
-            # 准事务补偿：已搬入项用 os.rename 直接还原（不受 shutil.move 注入影响），
-            # 不删任何项；清单标记 compensated，保证「已搬入 ⇒ 有记录 ⇒ 可追溯」
-            for entry in manifest["items"]:
-                if entry.get("action") != "quarantine":
-                    continue
-                src = os.path.join(qdir, entry["rel"])
-                dst = os.path.join(manifest["root"], entry["rel"])
-                if os.path.exists(src) and not os.path.exists(dst):
-                    try:
-                        os.rename(src, dst)
-                        entry["status"] = "compensated"
-                    except OSError as e:
-                        log("补偿回滚失败 %s : %s" % (entry["rel"], e))
-                        entry["status"] = "compensation_failed"
+            # 幂等补偿状态机：只据磁盘真实状态收敛，不覆盖、不丢副本；
+            # 终态项跳过，故重入/二次中断也安全。清单保留全部项的取证与最终状态。
+            counts = Engine.compensate(manifest, qdir, log)
             _flush()
-            log("已中断：%d 项已补偿回滚，清单保留取证。" % moved)
+            log("已中断：补偿还原 %d / 冲突保留 %d / 失败告警 %d，清单状态已统一。"
+                % (counts.get(ST_COMPENSATED, 0), counts.get(ST_CONFLICT, 0),
+                   counts.get(ST_FAILED, 0)))
             raise
         log("已隔离 %d 项 → %s" % (moved, qdir))
 
