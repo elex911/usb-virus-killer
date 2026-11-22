@@ -25,6 +25,7 @@ BUILTIN_MODULES = (
     "modules.modern_threats",
     "modules.amsi_scan",
     "modules.active_defense",
+    "modules.offline_forensics",
 )
 
 

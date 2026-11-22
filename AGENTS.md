@@ -20,6 +20,7 @@
 6. **测试环境用后必清**：临时目录 try/finally shutil.rmtree；测试注册表操作用接缝注入模拟，不做真实写入后不清理的事。
 7. **隐私**：作者电话一律掩码 `180******66`（界面/文档/测试断言三处同步）；不得把任何密钥/真实路径样本写进交付物。
 8. **本地磁盘与系统盘护栏**（用户 2026-11-22 明确授权 C 盘完整查杀）：本地固定磁盘默认可查杀，`allow_fixed` 在 Context / 各模块 `prepare_context` / GUI 三处默认均为 True；系统盘处置前必须二次确认。`Windows` / `Program Files` / `ProgramData` / `System Volume Information` / `$Recycle.Bin` / `Recovery` / 页面文件等关键路径只进报告，**不隔离、不改隐藏属性、不作强杀确证锚点**——这是防系统不可启动的底线，不是功能缺失；改动时不得用"完整查杀"为由移除。
+9. **WinPE 离线取证边界**（用户 2026-11-22 选「双轨并存 + 只读解析为主」）：离线 Hive 只读解析，禁止 `RegLoadKey` 挂载做检测；MiniNT 键可伪造，必须复合判定；离线 `SYSTEM` 无 `CurrentControlSet`，须读 `Select\Current`。修复若未来开放，必须"先备份 Hive → 挂载 → 写入 → 验证 → 卸载"，且单独授权。禁止向 `X:\` 写日志/临时/隔离区。当前 Python 栈**不是** WinPE 原生程序，不得宣称 PE 内可启动；Rust 静态引擎未实现。无内嵌签名 ≠ 恶意（CatRoot 编录签名）。
 
 ## 改动纪律（每步验收标准）
 

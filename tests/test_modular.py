@@ -4,6 +4,7 @@ import io
 import json
 import os
 import shutil
+import struct
 import sys
 import tempfile
 
@@ -1362,7 +1363,7 @@ def test_report_export_contract():
         {"host_diagnostics_readonly": [1]}
     assert hdm.report_export(ActionResult()) == {"host_diagnostics_readonly": []}
 
-    # 模拟主程序合并：仅这两个模块贡献顶层字段，其余模块必须返回空
+    # 模拟主程序合并：仅这三个模块贡献顶层字段，其余模块必须返回空
     instances, _errs = load_modules()
     mods = {m.meta["id"]: m for m in instances}
     data = {}
@@ -1373,11 +1374,13 @@ def test_report_export_contract():
             assert extra == {"root": None, "meta": None, "items": None, "hidden_items": None}, extra
         elif mid == "host_diagnostics":
             assert extra == {"host_diagnostics_readonly": []}, extra
+        elif mid == "offline_forensics":
+            assert extra == {"offline_forensics": {}}, extra
         else:
             assert extra == {}, (mid, extra)
         if isinstance(extra, dict):
             data.update(extra)
-    print("[OK] 报告导出契约: 7 模块自声明字段 / 默认空 / app.py 无硬编码依赖")
+    print("[OK] 报告导出契约: 9 模块自声明字段 / 默认空 / app.py 无硬编码依赖")
 
 
 def test_report_iso():
@@ -1817,6 +1820,216 @@ def test_system_drive_action_confirmation():
     print("[OK] 系统盘处置二次确认，非系统盘不受影响")
 
 
+# ---------------- WinPE 离线取证（只读） ----------------
+
+def _nk_payload(name, sublist=0xFFFFFFFF, subcount=0, vallist=0xFFFFFFFF,
+                valcount=0, parent=0):
+    p = bytearray(76)
+    p[0:2] = b"nk"
+    struct.pack_into("<H", p, 2, 0x20)          # COMP_NAME
+    struct.pack_into("<I", p, 16, parent)
+    struct.pack_into("<I", p, 20, subcount)
+    struct.pack_into("<I", p, 24, 0)
+    struct.pack_into("<I", p, 28, sublist)
+    struct.pack_into("<I", p, 32, 0xFFFFFFFF)
+    struct.pack_into("<I", p, 36, valcount)
+    struct.pack_into("<I", p, 40, vallist)
+    struct.pack_into("<I", p, 44, 0xFFFFFFFF)
+    struct.pack_into("<I", p, 48, 0xFFFFFFFF)
+    struct.pack_into("<H", p, 72, len(name))
+    p.extend(name.encode("latin-1"))
+    return bytes(p)
+
+
+def _build_mini_hive(path):
+    """手写最小 regf 字节；不复用解析器代码，避免循环自证。"""
+    buf = bytearray(b"\x00" * 0x1000)
+    buf[0:4] = b"regf"
+    struct.pack_into("<I", buf, 0x24, 32)
+    buf.extend(bytearray(32))
+    buf[0x1000:0x1004] = b"hbin"
+    struct.pack_into("<I", buf, 0x1004, 0)
+
+    def add(payload):
+        off = len(buf) - 0x1000
+        buf.extend(struct.pack("<i", -(len(payload) + 4)))
+        buf.extend(payload)
+        return off
+
+    def patch(off, payload):
+        pos = 0x1000 + off
+        struct.pack_into("<i", buf, pos, -(len(payload) + 4))
+        buf[pos + 4:pos + 4 + len(payload)] = payload
+
+    def sublist(offs):
+        p = bytearray(b"lf" + struct.pack("<H", len(offs)))
+        for o in offs:
+            p.extend(struct.pack("<II", o, 0))
+        return add(bytes(p))
+
+    def vallist(offs):
+        return add(b"".join(struct.pack("<I", o) for o in offs))
+
+    def vk(name, vtype, payload, data_cell=None):
+        p = bytearray(20)
+        p[0:2] = b"vk"
+        struct.pack_into("<H", p, 2, len(name))
+        if data_cell is None:
+            struct.pack_into("<I", p, 4, 0x80000000 | len(payload))
+            struct.pack_into("<I", p, 8, 0)
+        else:
+            struct.pack_into("<I", p, 4, len(payload))
+            struct.pack_into("<I", p, 8, data_cell)
+        struct.pack_into("<I", p, 12, vtype)
+        struct.pack_into("<H", p, 16, 0x01)
+        p.extend(name.encode("latin-1"))
+        if data_cell is None:
+            p.extend(payload)
+        return add(bytes(p))
+
+    root_off = add(_nk_payload(""))
+    v_current = vk("Current", 4, struct.pack("<I", 2))
+    select_nk = add(_nk_payload("Select", vallist=vallist([v_current]), valcount=1))
+
+    img_text = "C:\\evil\\payload.exe\x00"
+    d_img = add(img_text.encode("utf-16-le"))
+    v_img = vk("ImagePath", 1, img_text.encode("utf-16-le"), d_img)
+    v_start = vk("Start", 4, struct.pack("<I", 1))
+    evil_nk = add(_nk_payload("EvilSvc",
+                              vallist=vallist([v_img, v_start]), valcount=2))
+    services_nk = add(_nk_payload("Services", sublist=sublist([evil_nk]), subcount=1))
+    cs_nk = add(_nk_payload("ControlSet002", sublist=sublist([services_nk]), subcount=1))
+    root_subs = sublist([select_nk, cs_nk])
+    patch(root_off, _nk_payload("", sublist=root_subs, subcount=2))
+    struct.pack_into("<I", buf, 0x28, len(buf) - 0x1000)
+    with open(path, "wb") as f:
+        f.write(bytes(buf))
+
+
+def test_offline_registry_readonly_synthetic():
+    """手写 hive 夹具：Select\\Current 陷阱、服务项、只读不改动文件。"""
+    from core import offline_registry as oreg
+    tmp = tempfile.mkdtemp(prefix="fk_hive_", dir=ROOT)
+    try:
+        p = os.path.join(tmp, "SYSTEM")
+        _build_mini_hive(p)
+        before = open(p, "rb").read()
+        with oreg.RegistryHive(p) as h:
+            assert oreg.select_current_number(h) == 2
+            assert oreg.control_set_name(h) == "ControlSet002"
+            assert "Select" in h.root.subkey_names()
+            img = h.value("ControlSet002\\Services\\EvilSvc", "ImagePath")
+            assert img == "C:\\evil\\payload.exe", repr(img)
+            rows, errors = oreg.read_persistence(h, None)
+            assert not errors, errors
+            assert any(r["name"] == "EvilSvc" for r in rows), rows
+        assert open(p, "rb").read() == before, "只读解析不得改动 hive 文件"
+        print("[OK] 离线 Hive 只读解析：Select\\Current=2、服务项、文件字节未变")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_offline_registry_real_hive_crosscheck():
+    """真实 hive 与在线 winreg 双路核对（各有独立机制）。"""
+    from core import offline_registry as oreg
+    p = "C:" + os.sep + "Users" + os.sep + "Default" + os.sep + "NTUSER.DAT"
+    if not os.path.exists(p):
+        print("[SKIP] 真实 hive 不可读，跳过交叉验证")
+        return
+    try:
+        import winreg
+        live_key = winreg.OpenKey(winreg.HKEY_USERS, ".DEFAULT\\Environment")
+        live, i = {}, 0
+        while True:
+            try:
+                name = winreg.EnumValue(live_key, i)[0]
+                live[name] = winreg.QueryValueEx(live_key, name)[0]
+                i += 1
+            except OSError:
+                break
+    except Exception as exc:
+        print("[SKIP] 在线注册表不可比：%s" % exc)
+        return
+    with oreg.RegistryHive(p) as h:
+        parsed = {k: v for k, (_t, v) in h.open("Environment").values().items()}
+    assert live and parsed == live, (parsed, live)
+    print("[OK] 真实 NTUSER.DAT 与在线注册表一致（%d 个值）" % len(live))
+
+
+def test_offline_environment_and_path_mapping():
+    from modules import offline_forensics as of
+    env = of.detect_environment({"SystemDrive": "X:", "windir": "X:\\Windows"}, lambda: True)
+    assert env["level"] == "确认" and env["is_winpe"] is True
+    spoof = of.detect_environment({"SystemDrive": "C:", "windir": "C:\\Windows"}, lambda: True)
+    assert spoof["level"] == "疑似" and spoof["is_winpe"] is False, "MiniNT 可伪造，不得单信号放行"
+    text, hits = of.translate_offline_path(
+        "C:\\Windows\\evil.exe, %ProgramData%\\x", of.build_path_map("D:"))
+    assert text == "D:\\Windows\\evil.exe, D:\\ProgramData\\x", text
+    assert len(hits) == 2, hits
+    ok, _ = of.guard_output_path("X:\\temp\\log.txt", {"TEMP": "X:\\temp"})
+    assert ok is False
+    ok, _ = of.guard_output_path("D:\\PortableAV_Quarantine", {"TEMP": "X:\\temp"})
+    assert ok is True
+    print("[OK] WinPE 复合识别、盘符漂移翻译、X:\\ 写入护栏")
+
+
+def test_offline_target_discovery_and_tasks():
+    from modules import offline_forensics as of
+    candidates = {"D:\\Windows\\System32\\config\\SYSTEM",
+                  "E:\\Windows\\System32\\ntoskrnl.exe"}
+    found = of.find_target_systems(["C:", "D:", "E:", "X:"],
+                                   exists=lambda p: p in candidates)
+    assert [x["drive"] for x in found] == ["D:", "E:"], found
+    assert found[0]["strength"] == "强" and found[1]["strength"] == "弱"
+    tmp = tempfile.mkdtemp(prefix="fk_offline_", dir=ROOT)
+    try:
+        task_dir = os.path.join(tmp, "Windows", "System32", "Tasks")
+        os.makedirs(task_dir)
+        token = of.SUSPICIOUS_PATTERNS[0][0]
+        xml = ('<?xml version="1.0"?><Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+               '<Actions><Exec><Command>' + token + '.exe</Command>'
+               '<Arguments>-enc AAAA</Arguments></Exec></Actions></Task>')
+        with open(os.path.join(task_dir, "evil"), "w", encoding="utf-8") as f:
+            f.write(xml)
+        rows, errors = of.scan_task_xml(tmp)
+        assert not errors, errors
+        assert any(r["level"] == "关注" for r in rows), rows
+        print("[OK] 离线系统盘定位 + 计划任务 XML 不依赖 COM")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_offline_forensics_module_contract_and_run():
+    from modules import offline_forensics as of
+    mods, errors = load_modules()
+    assert not errors, errors
+    mod = next(m for m in mods if m.meta["id"] == "offline_forensics")
+    ctx = Context()
+    assert mod.prepare_context(ctx, "D:  [本地固定磁盘]")
+    assert ctx.target == "D:" + os.sep and ctx.is_drive is True
+    assert {a.id for a in mod.actions()} == {"detect", "scan"}
+    tmp = tempfile.mkdtemp(prefix="fk_offline_run_", dir=ROOT)
+    try:
+        cfg = os.path.join(tmp, "Windows", "System32", "config")
+        os.makedirs(cfg)
+        _build_mini_hive(os.path.join(cfg, "SYSTEM"))
+        task_dir = os.path.join(tmp, "Windows", "System32", "Tasks")
+        os.makedirs(task_dir)
+        token = of.SUSPICIOUS_PATTERNS[0][0]
+        with open(os.path.join(task_dir, "job"), "w", encoding="utf-8") as f:
+            f.write("<Task><Command>%s.exe</Command><Arguments>-enc QQ==</Arguments></Task>" % token)
+        res = mod.run("scan", Context(target=tmp), lambda m: None)
+        assert res.ok and res.report["scanned"] is True
+        assert res.report["concern_count"] >= 1, res.report
+        assert "Select\\Current" not in str(res.report), "不得把内部字段当结论"
+        assert mod.report_export(res)["offline_forensics"]["target"] == tmp
+        det = mod.run("detect", Context(), lambda m: None)
+        assert det.ok and det.report["scanned"] is False
+        print("[OK] 离线取证模块契约与只读扫描全链路")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_discovery()
     test_plugin_hot_discovery()
@@ -1840,4 +2053,9 @@ if __name__ == "__main__":
     test_system_protected_path_rules()
     test_system_protected_never_quarantined()
     test_system_drive_action_confirmation()
+    test_offline_registry_readonly_synthetic()
+    test_offline_registry_real_hive_crosscheck()
+    test_offline_environment_and_path_mapping()
+    test_offline_target_discovery_and_tasks()
+    test_offline_forensics_module_contract_and_run()
     print("ALL PASS")

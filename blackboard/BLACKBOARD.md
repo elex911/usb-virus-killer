@@ -9,17 +9,18 @@
 ## 一、功能总结
 
 ### 1. 架构
-- 契约层：Action/ActionResult/Context 三 dataclass + ModuleBase 默认实现，8 个模块全部实现 actions/run/build_view/render/detail 契约，无一破坏（core/api.py:17-96）。
-- 注册表：8 内置模块经 BUILTIN_MODULES 声明式注册；plugins/*.py 动态加载，`_fk_plugin_` 前缀隔离 sys.modules，单模块失败不中断（core/registry.py:19-28, 59-101）。
+- 契约层：Action/ActionResult/Context 三 dataclass + ModuleBase 默认实现，9 个模块全部实现 actions/run/build_view/render/detail 契约，无一破坏（core/api.py:17-96）。
+- 注册表：9 内置模块经 BUILTIN_MODULES 声明式注册；plugins/*.py 动态加载，`_fk_plugin_` 前缀隔离 sys.modules，单模块失败不中断（core/registry.py:19-28, 59-101）。
 - 主程序：自述"只调度不认识业务"（app.py:5-6）；按钮/标签页由模块生成（app.py:87-120）；worker 线程 + queue 120ms 轮询回主线程（app.py:235, 258-293）；报告导出含 v1.x 兼容字段（app.py:296-343）。但存在硬编码例外（见三.3）。
 - 入口：FolderVirusKiller.py 仅 22 行，--restore 直调 Engine.restore（FolderVirusKiller.py:13-16）；根目录 HostDiagnostics.py 为 3 行兼容 shim。
-- 打包：spec 隐藏导入覆盖 8 模块+core 三件（文件夹病毒查杀工具.spec:9）；datas=[] 不捆绑特征库，外部交付，与文档口径自洽。
+- 打包：spec 隐藏导入覆盖 9 模块+core 三件（文件夹病毒查杀工具.spec:9）；datas=[] 不捆绑特征库，外部交付，与文档口径自洽。
 
 ### 2. 检测与查杀
 - 本地特征库：空库起步绝不覆盖（modules/signature_db.py:120-131），当前 0 规则（T2）；规则校验完备（T3 禁启用 :196-197、正则可编译 :183-187）；规则包版本化导入+禁降级+整包拒绝（:623-661）；字节级备份保留 10 份可回滚（:228-246）；扫描只读、跳过 >64MB 与隔离目录（:275-305）。
 - ClamAV 桥接：不捆绑引擎，PATH+常见安装根发现（modules/clamav_bridge.py:74-92）；扫描前清残留日志防跨次污染（:328-335）；freshclam 三态中文摘要（:144-187）；只报告绝不用 --remove/--move（docstring:9, :206-209）。
 - AMSI 脚本评估：Win10+ 经 amsi.dll，高危/关注/信息三级（modules/amsi_scan.py:36-109）；不可用优雅降级（:25-29, 181-191）；接缝可注入便于测试（:44-47）。
-- 文件夹病毒：双置信判定（高置信=隐藏属性+同名原文件+同名 .lnk，modules/folder_virus.py:193-203）；.lnk 二进制解析不依赖 COM（:112-125）；隔离入 __WORM_QUARANTINE_ 时间戳目录、写 manifest 可回滚（:250-322）；autorun.inf 免疫（:324-334）；拒系统盘/固定盘需显式允许（:139-158）。
+- 文件夹病毒：双置信判定（高置信=隐藏属性+同名原文件+同名 .lnk，modules/folder_virus.py:193-203）；.lnk 二进制解析不依赖 COM（:112-125）；隔离入 __WORM_QUARANTINE_ 时间戳目录、写 manifest 可回滚（:250-322）；autorun.inf 免疫（:324-334）；本地磁盘/系统盘默认放行，系统关键路径只报告不隔离（:139-158, :34-40）。
+- 离线取证（只读）：core/offline_registry.py 直接解析 regf（不挂载/不提权），离线 SYSTEM 无 CurrentControlSet、须读 Select\\Current；modules/offline_forensics.py 做 MiniNT+X: 复合识别、目标盘定位、C:\\→真实盘符翻译、任务 XML 与 PE 安全目录（core/offline_registry.py:280-301, modules/offline_forensics.py:66-140）。红线：MiniNT 单信号只算疑似；无内嵌签名不等于恶意（notepad 靠 CatRoot）；X:\\ 禁写；当前非 WinPE 原生程序，Rust 静态引擎未实现。
 - 现代威胁（只读）：6 类采集——WMI 订阅/计划任务/BHO/脚本关联/进程路径/勒索痕迹（modules/modern_threats.py:140-345）；白名单降噪（:48-51）。**注意：WMI 订阅与脚本关联两个采集点实现有误，检测能力实际失效（见三.1/2）。**
 
 ### 3. 诊断与修复

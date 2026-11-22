@@ -591,6 +591,48 @@ def s_local_disk(log):
     return ok, checks, tmp
 
 
+@case("20 WinPE 离线取证只读解析")
+def s_offline_forensics(log):
+    """离线 Hive/任务 XML 只读解析；验证 Select\\Current 与 X:\\ 红线。"""
+    import importlib.util
+    from core import offline_registry as oreg
+    from modules import offline_forensics as of
+    from core.api import Context
+
+    spec = importlib.util.spec_from_file_location(
+        "fk_test_helpers", os.path.join(ROOT, "tests", "test_modular.py"))
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+
+    tmp = tempfile.mkdtemp(prefix="tb_offline_", dir=RESULTS_DIR)
+    cfg = os.path.join(tmp, "Windows", "System32", "config")
+    os.makedirs(cfg)
+    hive_path = os.path.join(cfg, "SYSTEM")
+    helpers._build_mini_hive(hive_path)
+    before = open(hive_path, "rb").read()
+    task_dir = os.path.join(tmp, "Windows", "System32", "Tasks")
+    os.makedirs(task_dir)
+    token = of.SUSPICIOUS_PATTERNS[0][0]
+    with open(os.path.join(task_dir, "job"), "w", encoding="utf-8") as f:
+        f.write("<Task><Command>%s.exe</Command><Arguments>-enc QQ==</Arguments></Task>" % token)
+
+    with oreg.RegistryHive(hive_path) as h:
+        current = oreg.select_current_number(h)
+    res = of.Module().run("scan", Context(target=tmp), log)
+    checks = {
+        "select_current": current,
+        "concern_rows": res.report.get("concern_count", 0),
+        "hive_unchanged": open(hive_path, "rb").read() == before,
+        "readonly_report": res.report.get("scanned") is True,
+        "x_drive_blocked": of.guard_output_path("X:\\tmp\\log.txt",
+                                                {"TEMP": "X:\\tmp"})[0] is False,
+    }
+    ok = (current == 2 and checks["concern_rows"] > 0
+          and checks["hive_unchanged"] and checks["readonly_report"]
+          and checks["x_drive_blocked"])
+    return ok, checks, tmp
+
+
 def exe_info():
     dist = os.path.join(ROOT, "dist")
     out = {"exe_built": None, "exe_bytes": None}
