@@ -45,7 +45,7 @@
 
 | # | 遗留项 | 风险 | 建议 |
 |---|---|---|---|
-| 1 | git 历史旧提交仍含完整手机号（重写历史会改全部哈希） | 仓库公开翻历史可暴露 | 公开仓库前执行 `git filter-repo` + force push，或保持私有 |
+| 1 | ~~git 历史旧提交仍含完整手机号~~ **已闭环（2026-11-22）** | 已消除 | `git filter-repo --replace-text` 重写 9 提交 + force push；全历史 `git log -S` 与 `git grep`（含 GitHub 全新克隆）双向验证 0 命中；仓库已改为 public，匿名克隆可访问；新 HEAD `4e94aa7`。本地回滚备份在仓库外 `usb-virus-killer-backup-pre-rewrite/`（含旧历史，禁止进入工作流） |
 | 2 | ClamAV 为可选外部依赖，未装环境下 ClamAV 模块行为=「未找到引擎」提示（有测试锚定） | 低 | 保持现状 |
 | 3 | 免疫对已存在 autorun.inf 只拒绝不代删（有意设计，红线「不删用户文件」） | 低 | 保持现状，文档已注明 |
 
