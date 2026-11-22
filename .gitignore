@@ -19,6 +19,10 @@ dist/
 *.log
 signature_db.local.json
 
+# PortableAV runtime / output（工作目录、隔离区、报告均为运行产物）
+portableav/_work/
+portableav_rules_local/
+
 # Editor and OS
 .vscode/
 .idea/

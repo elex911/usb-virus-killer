@@ -17,9 +17,21 @@ from typing import List, Optional
 
 from . import catroot, chain as chainmod, drives, env as envmod, matcher as matchmod
 from . import paths as pathmod, pe as pemod, quarantine as qmod, report as reportmod
-from . import revoke, scan as scanmod, trust
+from . import revoke, scan as scanmod, trust, workdir as workmod
 
 DEFAULT_RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _plan_workdir(args, e, target: str = "") -> workmod.WorkdirPlan:
+    """按优先级挑工作目录；显式指定目标盘会被告知取证影响。"""
+    tgt_drive = pathmod.norm_drive(os.path.splitdrive(os.path.abspath(target))[0]) if target else ""
+    explicit = "" if args.workdir in ("", "auto") else args.workdir
+    return workmod.plan_workdir(explicit=explicit, app_dir=APP_DIR,
+                                target_drive=tgt_drive,
+                                system_drive=e.system_drive or "X:",
+                                allow_target=args.allow_target_write,
+                                required_free_mb=args.min_free_mb)
 
 
 def _load_roots(arg: Optional[str]) -> List[chainmod.Cert]:
@@ -55,6 +67,18 @@ def cmd_env(args) -> int:
         print("未定位到离线系统盘（可改用 --target 指定目录）")
     for s in systems:
         print("  离线系统：%s" % s.label)
+
+    # 工作目录建议（决定临时文件/隔离区/报告写哪）
+    target = systems[0].windows_dir if systems else ""
+    tgt_drive = pathmod.norm_drive(os.path.splitdrive(os.path.abspath(target))[0]) if target else ""
+    plan = workmod.plan_workdir(app_dir=APP_DIR, target_drive=tgt_drive,
+                                system_drive=e.system_drive or "X:")
+    print()
+    print(plan.summary())
+    for p, r in plan.tried:
+        print("  %s → %s" % (p, r))
+    print("  提示：onefile 的解压发生在启动前，必须在启动器里设 TEMP 或构建时 --runtime-tmpdir；")
+    print("        代码里改 TEMP 只影响本进程后续的临时文件。")
     return 0
 
 
@@ -94,6 +118,26 @@ def cmd_scan(args) -> int:
     if not os.path.isdir(target):
         print("错误：目标不是目录：%s" % target)
         return 2
+
+    # 先定工作目录（TEMP/隔离区/报告），再干活——避免任何东西落到 X: 或目标盘
+    plan = _plan_workdir(args, e, target)
+    print(plan.summary())
+    if not plan.ok:
+        print("错误：没有可写的工作目录。可用 --workdir 指定，或加 --allow-target-write。")
+        for p, r in plan.tried:
+            print("  %s → %s" % (p, r))
+        return 2
+    envs = workmod.apply_env(plan.path)
+    print("  临时目录已重定向：%s（TMPDIR/TEMP/TMP 同时设置）" % envs["TEMP"])
+    if plan.on_target_drive and not args.apply:
+        print("  注意：工作目录在被检盘上，但当前是演练模式，不会改动被检文件。")
+
+    if not args.quarantine and args.apply:
+        args.quarantine = os.path.join(plan.path, "quarantine")
+    if not args.report:
+        import time as _t
+
+        args.report = os.path.join(plan.path, "report_%s.html" % _t.strftime("%Y%m%d_%H%M%S"))
 
     roots = _load_roots(args.roots)
     rl = _load_blacklist(args.blacklist)
@@ -191,7 +235,9 @@ def cmd_scan(args) -> int:
                                        "workers": "自动",
                                        "quarantine_items": qitems,
                                        "persistence_items": persist_items,
-                                       "persist_errors": persist_errors})
+                                       "persist_errors": persist_errors,
+                                       "workdir": plan.path,
+                                       "evidence_note": workmod.evidence_note(plan)})
         print("报告：%s" % out)
     return 0
 
@@ -287,6 +333,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-files", type=int, default=0)
     s.add_argument("--persist", choices=["auto", "on", "off"], default="auto",
                    help="持久化矩阵（auto=目标像 Windows 目录时才做）")
+    s.add_argument("--workdir", default="auto",
+                   help="工作目录（临时/隔离/报告）；auto=程序目录下 _work")
+    s.add_argument("--allow-target-write", action="store_true",
+                   help="允许自动候选包含目标盘的独立目录（默认绝不写被检盘）")
+    s.add_argument("--min-free-mb", type=float, default=256.0,
+                   help="工作目录最低剩余空间 MB")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_scan)
 

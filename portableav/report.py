@@ -190,10 +190,12 @@ ul{margin:6px 0 0 18px}
 <thead><tr><th>ID</th><th>状态</th><th>时间</th><th>原路径</th><th>SHA-256</th></tr></thead>
 <tbody>%(rows_q)s</tbody></table></div></div>
 
-<div class="panel"><h2>7. 扫描参数</h2><div class="body"><table>
+<div class="panel"><h2>7. 扫描参数与取证影响</h2><div class="body"><table>
 <tr><th>单文件上限</th><td>%(lim_size)s</td></tr>
 <tr><th>最大深度</th><td>%(lim_depth)s</td></tr>
 <tr><th>线程</th><td>%(workers)s</td></tr>
+<tr><th>工作目录</th><td class="mono">%(workdir)s</td></tr>
+<tr><th>取证影响</th><td>%(evnote)s</td></tr>
 </table></div></div>
 </div></body></html>
 """ % {
@@ -227,6 +229,8 @@ ul{margin:6px 0 0 18px}
         "lim_size": "%d MB" % (meta.get("max_file_mb", 100)),
         "lim_depth": _e(meta.get("max_depth", "-")),
         "workers": _e(meta.get("workers", "-")),
+        "workdir": _e(meta.get("workdir", "-")),
+        "evnote": _e(meta.get("evidence_note", "未记录")),
     }
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write(doc)
