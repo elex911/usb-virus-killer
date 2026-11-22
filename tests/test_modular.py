@@ -309,29 +309,33 @@ def test_compensation_state_machine():
     finally:
         shutil.rmtree(t2, ignore_errors=True)
 
-    # ---- 场景三：跨卷 os.rename 抛 EXDEV — 降级 copy2+校验+删源 ----
-    t3 = tempfile.mkdtemp(prefix="fk_exdev_", dir=ROOT)
+    # ---- 场景三：目标已存在时 O_EXCL 原子拒绝覆盖，两份副本都保留 ----
+    # 机制已从「先查后 rename」升级为「独占创建」，原 EXDEV 注入点不再适用，
+    # 故此用例改为验证新的原子不覆盖语义（更强的安全保证）。
+    t3 = tempfile.mkdtemp(prefix="fk_excl_", dir=ROOT)
     try:
         usb = os.path.join(t3, "usb")
         os.makedirs(usb)
-        qdir = os.path.join(usb, "__WORM_QUARANTINE_exdev")
+        qdir = os.path.join(usb, "__WORM_QUARANTINE_excl")
         os.makedirs(qdir)
         qfile = os.path.join(qdir, "z.lnk")
         with open(qfile, "wb") as f:
-            f.write(b"CROSSVOL")
+            f.write(b"QUARANTINED")
         ofile = os.path.join(usb, "z.lnk")
-
-        def exdev_rename(src, dst):
-            e = OSError("cross-device link")
-            e.errno = _errno.EXDEV
-            raise e
-
-        with um.patch("os.rename", exdev_rename):
+        with open(ofile, "wb") as f:
+            f.write(b"USER-EXISTING")  # 目标已被他人创建
+        import errno as _errno  # noqa: F401 — 保留导入兼容同函数其余场景
+        raised = False
+        try:
             fv.Engine._move_back(qfile, ofile, log=lambda m: None)
+        except FileExistsError:
+            raised = True
+        assert raised, "目标已存在时独占创建必须拒绝（FileExistsError）"
         with open(ofile, "rb") as f:
-            assert f.read() == b"CROSSVOL", "跨卷降级应完整复制"
-        assert not os.path.exists(qfile), "跨卷降级校验通过后应删除隔离副本"
-        print("[OK] 跨卷 EXDEV：降级 copy2+校验+删源")
+            assert f.read() == b"USER-EXISTING", "既有目标文件不得被覆盖"
+        with open(qfile, "rb") as f:
+            assert f.read() == b"QUARANTINED", "隔离副本不得丢失"
+        print("[OK] 目标已存在：O_EXCL 原子拒绝，两副本完整保留")
     finally:
         shutil.rmtree(t3, ignore_errors=True)
 
@@ -506,6 +510,132 @@ def test_restore_status_and_atomic_manifest():
         assert mf2["items"][0]["status"] == "restored", "补标应持久化: %r" % mf2
         assert fv.Engine.restore_summary(qdir)["count"] == 0
         print("[OK] 回滚重入：搬移成功但标记前中断 → 据磁盘补标 restored")
+    finally:
+        shutil.rmtree(t3, ignore_errors=True)
+
+
+def test_no_overwrite_race_and_itemwise_flush():
+    """补强复审#3：原子不覆盖（TOCTOU）+ 恢复逐项写回。
+    覆盖：restore/补偿检查通过后目标被抢先创建→不覆盖+标 conflict；
+          多项恢复中途 KeyboardInterrupt→已完成项已落盘、重试可继续。
+    """
+    import unittest.mock as um
+
+    def _make_usb(base, names):
+        usb = os.path.join(base, "usb")
+        os.makedirs(usb)
+        made = {}
+        for nm in names:
+            orig = os.path.join(usb, nm)
+            with open(orig, "wb") as f:
+                f.write(("ORIG-" + nm).encode("utf-8"))
+            fv.set_attr(orig, fv.FILE_ATTRIBUTE_HIDDEN | fv.FILE_ATTRIBUTE_SYSTEM)
+            lnk = os.path.join(usb, nm.rsplit(".", 1)[0] + ".lnk")
+            make_lnk(lnk, orig)
+            made[nm] = (orig, lnk)
+        return usb, made
+
+    # ---- 场景一：restore 检查通过后、创建前目标被抢先创建 → 不覆盖 + conflict ----
+    t1 = tempfile.mkdtemp(prefix="fk_race_restore_", dir=ROOT)
+    try:
+        usb, made = _make_usb(t1, ["照片.jpg"])
+        eng = fv.Engine(usb, False)
+        eng.precheck()
+        eng.scan(lambda m: None)
+        r = eng.clean(lambda m: None)
+        qdir = r["quarantine"]
+        lnk = made["照片.jpg"][1]
+        relay = os.path.join(qdir, os.path.basename(lnk))
+        assert os.path.exists(relay), "隔离副本应存在"
+        real_put = fv.Engine._exclusive_put
+
+        def racing_put(src, dst, log, **kw):
+            # 模拟竞态：restore 的 exists() 检查已通过，此刻目标被其他进程创建
+            with open(dst, "wb") as f:
+                f.write(b"USER-NEW-FILE")
+            return real_put(src, dst, log, **kw)
+
+        with um.patch.object(fv.Engine, "_exclusive_put", racing_put):
+            fv.Engine.restore(qdir, lambda m: None)
+        with open(lnk, "rb") as f:
+            assert f.read() == b"USER-NEW-FILE", "用户新文件不得被覆盖"
+        assert os.path.exists(relay), "隔离副本必须保留（两副本并存）"
+        with open(os.path.join(qdir, "manifest.json"), encoding="utf-8") as f:
+            mf = json.load(f)
+        qitems = [i for i in mf["items"] if i.get("action") == "quarantine"]
+        assert qitems and all(i.get("status") == "conflict" for i in qitems), mf
+        assert fv.Engine.restore_summary(qdir)["count"] == 0, "冲突项不应计入待回滚摘要"
+        print("[OK] restore TOCTOU：目标被抢先创建 → 不覆盖/副本保留/conflict")
+    finally:
+        shutil.rmtree(t1, ignore_errors=True)
+
+    # ---- 场景二：补偿路径同类竞态 ----
+    t2 = tempfile.mkdtemp(prefix="fk_race_comp_", dir=ROOT)
+    try:
+        usb = os.path.join(t2, "usb")
+        os.makedirs(usb)
+        qdir = os.path.join(usb, "__WORM_QUARANTINE_race")
+        os.makedirs(qdir)
+        qfile = os.path.join(qdir, "x.lnk")
+        with open(qfile, "wb") as f:
+            f.write(b"Q")
+        mf = {"root": usb, "items": [{"action": "quarantine", "rel": "x.lnk",
+              "status": "quarantined", "sha256": fv.Engine._sha256_file(qfile)}]}
+        real_put = fv.Engine._exclusive_put
+
+        def racing_put(src, dst, log, **kw):
+            with open(dst, "wb") as f:
+                f.write(b"USER-COMP")
+            return real_put(src, dst, log, **kw)
+
+        with um.patch.object(fv.Engine, "_exclusive_put", racing_put):
+            fv.Engine.compensate(mf, qdir, lambda m: None)
+        assert mf["items"][0]["status"] == "conflict", mf
+        with open(os.path.join(usb, "x.lnk"), "rb") as f:
+            assert f.read() == b"USER-COMP", "用户文件不得被补偿覆盖"
+        assert os.path.exists(qfile), "隔离副本必须保留"
+        print("[OK] 补偿 TOCTOU：目标被抢先创建 → 不覆盖/conflict")
+    finally:
+        shutil.rmtree(t2, ignore_errors=True)
+
+    # ---- 场景三：多项恢复中途 KeyboardInterrupt → 已完成项已落盘，重试可继续 ----
+    t3 = tempfile.mkdtemp(prefix="fk_flush_", dir=ROOT)
+    try:
+        usb, made = _make_usb(t3, ["a.jpg", "b.jpg", "c.jpg"])
+        eng = fv.Engine(usb, False)
+        eng.precheck()
+        eng.scan(lambda m: None)
+        r = eng.clean(lambda m: None)
+        qdir = r["quarantine"]
+        real_put = fv.Engine._exclusive_put
+        calls = {"n": 0}
+
+        def interrupt_second(src, dst, log, **kw):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise KeyboardInterrupt
+            return real_put(src, dst, log, **kw)
+
+        with um.patch.object(fv.Engine, "_exclusive_put", interrupt_second):
+            try:
+                fv.Engine.restore(qdir, lambda m: None)
+            except KeyboardInterrupt:
+                pass
+            else:
+                assert False, "中断必须向上传播，不得吞掉"
+        with open(os.path.join(qdir, "manifest.json"), encoding="utf-8") as f:
+            mf3 = json.load(f)
+        states = [i.get("status") for i in mf3["items"] if i.get("action") == "quarantine"]
+        assert states.count("restored") == 1, "中断前已完成项必须已逐项落盘: %r" % states
+        assert states.count("quarantined") >= 1, "未完成项应保持 quarantined 供重试: %r" % states
+        # 重试：已完成项跳过，未完成项继续恢复
+        okc, fail = fv.Engine.restore(qdir, lambda m: None)
+        assert fail == 0 and okc >= 1, (okc, fail)
+        with open(os.path.join(qdir, "manifest.json"), encoding="utf-8") as f:
+            mf4 = json.load(f)
+        assert all(i.get("status") == "restored" for i in mf4["items"]
+                   if i.get("action") == "quarantine"), mf4
+        print("[OK] 多项恢复中断：已完成项 restored 落盘，重试可继续")
     finally:
         shutil.rmtree(t3, ignore_errors=True)
 

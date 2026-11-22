@@ -315,29 +315,53 @@ class Engine:
         }
 
     @staticmethod
-    def _move_back(src, dst, log):
-        """把隔离副本搬回原路径。同卷 os.rename 原子搬移；跨卷降级 copy2+SHA256 校验后删源。
+    def _exclusive_put(src, dst, log, expect_sha=None):
+        """把 src 内容『原子且不覆盖』地放到 dst，成功后删除 src。
 
-        校验不符时保留两份副本并抛错（绝不删源、绝不覆盖目标）。
-        不使用 shutil.move —— 它与 clean 搬移同源，测试注入/异常语义应彼此独立。
+        核心：用 os.open(O_CREAT|O_EXCL|O_WRONLY) 把「目标不存在检查」与「创建」
+        合并为一次原子系统调用，消除 exists() 与搬移之间的 TOCTOU 竞态 —— 若目标
+        在检查后被其他进程创建，O_EXCL 必失败并抛 FileExistsError，绝不覆盖。
+        成功后流式复制 + fsync，可选 SHA-256 校验；任一失败删除『本次创建的目标』、
+        保留源文件，绝不留下半成品或吞掉他人文件。
         """
         os.makedirs(os.path.dirname(dst), exist_ok=True)
+        fd = None
+        created = False
         try:
-            os.rename(src, dst)
-            return "renamed"
-        except OSError as e:
-            import errno as _errno
-            is_cross = (getattr(e, "errno", None) == _errno.EXDEV
-                        or getattr(e, "winerror", None) == 17  # ERROR_NOT_SAME_DEVICE
-                        or e.errno == 18)
-            if not is_cross:
-                raise
-        # 跨卷：复制 → 校验 → 删源；任一环节失败保留两份副本
-        shutil.copy2(src, dst)
-        if Engine._sha256_file(src).lower() != Engine._sha256_file(dst).lower():
-            raise OSError("跨卷复制 SHA-256 校验不符，已保留两份副本，请人工核对")
-        os.remove(src)
-        return "copied"
+            # 独占创建：目标已存在立即失败（Windows FileExistsError / POSIX EEXIST）
+            fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+            with os.fdopen(fd, "wb") as f:
+                fd = None  # fdopen 接管所有权
+                with open(src, "rb") as s:
+                    for chunk in iter(lambda: s.read(1024 * 1024), b""):
+                        f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+            if expect_sha and len(str(expect_sha)) == 64:
+                if Engine._sha256_file(dst).lower() != str(expect_sha).lower():
+                    raise OSError("目标 SHA-256 校验不符，已保留隔离副本")
+            os.remove(src)  # 校验通过才删除源
+            return "exclusive_put"
+        except BaseException:
+            # 只删除『本次独占创建』的目标；FileExistsError 时 created=False，不碰他人文件
+            if created:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _move_back(src, dst, log, expect_sha=None):
+        """把隔离副本搬回原路径（原子不覆盖）。校验不符/目标已存在均保留两份副本。"""
+        return Engine._exclusive_put(src, dst, log, expect_sha=expect_sha)
 
     @staticmethod
     def _reconcile_one(entry, qdir, root, log):
@@ -374,9 +398,15 @@ class Engine:
                     entry["status"] = ST_FAILED
                     log("补偿拒绝（SHA-256 不符，隔离副本疑似篡改）：%s" % rel)
                 else:
-                    Engine._move_back(src, dst, log=log)
-                    entry["status"] = ST_COMPENSATED
-                    log("补偿已还原：%s" % rel)
+                    try:
+                        Engine._move_back(src, dst, log=log, expect_sha=expected or None)
+                    except FileExistsError:
+                        # 竞态：检查通过后目标被抢先创建 → 保留两份，标 conflict，绝不覆盖
+                        entry["status"] = ST_CONFLICT
+                        log("补偿发现目标在检查后被创建，保留两份副本：%s" % rel)
+                    else:
+                        entry["status"] = ST_COMPENSATED
+                        log("补偿已还原：%s" % rel)
             elif dst_in and not src_in:
                 # 源已不在隔离区、目标在原路径：已还原（含上次补偿中断后重入）
                 entry["status"] = ST_COMPENSATED
@@ -533,6 +563,7 @@ class Engine:
                     # 上次搬移成功但标记前中断：据磁盘状态补标 restored，不重复搬、不误报
                     it["status"] = ST_RESTORED
                     dirty = True
+                    _flush()  # 逐项写回：补标立即落盘
                     okc += 1
                     log("回滚补标（文件已在原路径）：%s" % rel)
                 else:
@@ -551,18 +582,30 @@ class Engine:
                     fail += 1
                     continue
             if dst_in:
-                # 不覆盖用户现有文件：宁可该项回滚失败留给人工，也不静默吞掉现状
-                log("回滚跳过（目标已存在，不覆盖）：%s" % dst)
+                # 目标在检查时已存在：不覆盖，标 conflict 并逐项写回（不静默吞掉现状）
+                it["status"] = ST_CONFLICT
+                dirty = True
+                _flush()
                 fail += 1
+                log("回滚跳过（目标已存在，不覆盖，标冲突）：%s" % dst)
                 continue
             try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                # 先搬移成功，再标 restored 并原子落盘：绝不留「标了已恢复但文件还在隔离区」
-                # 的假恢复窗口。若搬移后、标记前被中断，重入时由上面的 dst_in 分支补标。
-                shutil.move(src, dst)
+                # 原子不覆盖搬移：O_EXCL 把「检查目标不存在」与「创建」合并为一次
+                # 系统调用；若检查后目标被抢先创建，必抛 FileExistsError，绝不覆盖。
+                # 成功后标 restored 并【立即】原子落盘，绝不留「标了已恢复但文件还在
+                # 隔离区」的假恢复窗口；重入时由上面的 dst_in 分支补标。
+                Engine._exclusive_put(src, dst, log, expect_sha=expected or None)
                 it["status"] = ST_RESTORED
                 dirty = True
+                _flush()  # 逐项写回：每成功一项立即落盘
                 okc += 1
+            except FileExistsError:
+                # 竞态：检查通过后、创建前目标被其他进程创建 → 保留两份、标冲突
+                it["status"] = ST_CONFLICT
+                dirty = True
+                _flush()
+                fail += 1
+                log("回滚发现目标在检查后被创建，保留两份副本并标冲突：%s" % rel)
             except Exception as e:
                 log("回滚失败 %s : %s" % (rel, e))
                 fail += 1
