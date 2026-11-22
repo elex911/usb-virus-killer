@@ -26,6 +26,12 @@ portableav_rules_local/
 dist_portable/
 .workbuddy/build_portable/
 
+# research/ 下的时点快照：跑快照内的测试会生成同名运行产物（_work、构建缓存），
+# 这些是运行副产物，不该进版本库。
+research/**/_work/
+research/**/.workbuddy/
+research/**/__pycache__/
+
 # Editor and OS
 .vscode/
 .idea/
