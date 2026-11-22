@@ -288,13 +288,11 @@ def tail_slack(body: bytes) -> int:
     return len(body) - ci.end
 
 
-def embedded_signatures(fp, pe: PEInfo) -> List[EmbeddedSignature]:
-    """枚举 WIN_CERTIFICATE 链里的所有签名（含双签名的第二条）。"""
-    if not pe.has_signature:
-        return []
-    fp.seek(pe.cert_file_offset)
-    blob = fp.read(pe.cert_size)
-    out: List[EmbeddedSignature] = []
+def iter_cert_entries(blob: bytes):
+    """遍历 WIN_CERTIFICATE 链，产出 (body, revision, cert_type, dw_length)。
+
+    body 就是 PKCS#7 SignedData 的原始字节，可直接交给 chain.verify_pkcs7。
+    """
     pos = 0
     while pos + 8 <= len(blob):
         dw_len = int.from_bytes(blob[pos:pos + 4], "little")
@@ -302,7 +300,18 @@ def embedded_signatures(fp, pe: PEInfo) -> List[EmbeddedSignature]:
         ctype = int.from_bytes(blob[pos + 6:pos + 8], "little")
         if dw_len < 8 or pos + dw_len > len(blob):
             break
-        body = blob[pos + 8:pos + dw_len]
+        yield blob[pos + 8:pos + dw_len], rev, ctype, dw_len
+        pos += (dw_len + 7) & ~7
+
+
+def embedded_signatures(fp, pe: PEInfo) -> List[EmbeddedSignature]:
+    """枚举 WIN_CERTIFICATE 链里的所有签名（含双签名的第二条）。"""
+    if not pe.has_signature:
+        return []
+    fp.seek(pe.cert_file_offset)
+    blob = fp.read(pe.cert_size)
+    out: List[EmbeddedSignature] = []
+    for body, rev, ctype, dw_len in iter_cert_entries(blob):
         try:
             sig = parse_pkcs7(body)
         except SigError as exc:
@@ -316,7 +325,6 @@ def embedded_signatures(fp, pe: PEInfo) -> List[EmbeddedSignature]:
             if slack > 8:
                 sig.error = "签名表尾部存在 %d 字节非 ASN.1 数据" % slack
         out.append(sig)
-        pos += (dw_len + 7) & ~7  # WIN_CERTIFICATE 按 8 字节对齐
     return out
 
 
