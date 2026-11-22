@@ -14,6 +14,7 @@ jobs:
     runs-on: windows-latest
     env:
       OPENBLAS_NUM_THREADS: "1"
+      PYTHONIOENCODING: "utf-8"   # GitHub runner 控制台默认 cp1252，中文测试台输出会崩
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
