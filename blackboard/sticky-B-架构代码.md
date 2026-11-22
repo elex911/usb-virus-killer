@@ -3,7 +3,7 @@
 ## 一、功能总结（客观现状）
 
 1. 契约层 `core/api.py`：Action/ActionResult/Context 三个 dataclass + ModuleBase 默认实现（api.py:17-96）。Action.prompt 支持 directory|file（api.py:27），主线程弹窗后经 `ctx.pick` 注入（app.py:220-232）。Action/ActionResult/dict 三种返回兼容（app.py:243-247）。
-2. 注册表 `core/registry.py`：7 个内置模块经 BUILTIN_MODULES 声明式注册（registry.py:19-27）；plugins/*.py 动态加载（registry.py:74-101），以 `_fk_plugin_` 前缀隔离 sys.modules，ID 去重（registry.py:66-72,95-98），单模块失败收集为 errors 不中断（registry.py:59-60），按 (order,name) 排序（registry.py:103）。
+2. 注册表 `core/registry.py`：8 个内置模块经 BUILTIN_MODULES 声明式注册（registry.py:19-28）；plugins/*.py 动态加载（registry.py:74-101），以 `_fk_plugin_` 前缀隔离 sys.modules，ID 去重（registry.py:66-72,95-98），单模块失败收集为 errors 不中断（registry.py:59-60），按 (order,name) 排序（registry.py:103）。
 3. 主程序 `core/app.py`：自述"只调度不认识业务"（app.py:5-6）。按钮完全由 actions() 生成（app.py:87-99），标签页由 build_view() 生成并容错降级（app.py:111-120）；worker 线程执行 + queue 120ms 轮询回主线程（app.py:235,258-293）；报告导出含 v1.x 兼容字段（app.py:296-343）。盘符下拉由各模块 suggest_targets 聚合去重（app.py:140-166）。
 4. `core/widgets.py`：ResultTable 通用表格，tag 着色、双击详情回调（widgets.py:7-66）。空表 set_rows 安全（已实测 `tv.delete()` 空参不抛错，T2）。
 5. `FolderVirusKiller.py`：仅 22 行入口，--restore 直调 Engine.restore（FolderVirusKiller.py:13-16），其余转 core.app。根目录 HostDiagnostics.py 为 3 行兼容 shim（HostDiagnostics.py:3）。

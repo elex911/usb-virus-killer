@@ -541,6 +541,56 @@ def s_corrupt_db(log):
     return ok, checks, tmp
 
 
+@case("19 本地磁盘与系统盘查杀（含关键路径护栏）")
+def s_local_disk(log):
+    """本地磁盘为一等公民：默认放行、系统盘可查、关键路径只报告不改动。"""
+    tmp = tempfile.mkdtemp(prefix="tb_localdisk_", dir=RESULTS_DIR)
+    checks = {}
+    checks["default_allow_fixed"] = Context().allow_fixed is True
+    root, is_drive = fv.norm_target("D:  [本地固定磁盘]")
+    checks["display_text"] = (root == "D:" + chr(92) and is_drive)
+
+    sysroot = os.path.splitdrive(os.environ.get("SystemDrive", "C:"))[0].upper() + chr(92)
+    orig_dt = fv.drive_type
+    fv.drive_type = lambda r: 3
+    try:
+        eng_sys = fv.Engine(sysroot, True, True)
+        eng_sys.precheck()
+        checks["system_drive_allowed"] = eng_sys.meta.get("is_system_drive") is True
+    except Exception as exc:
+        checks["system_drive_allowed"] = "拒绝: %s" % exc
+    finally:
+        fv.drive_type = orig_dt
+
+    # 本地磁盘目录模式：合成感染样本必须能查出、隔离
+    local = os.path.join(tmp, "local_disk")
+    fixtures.build_infected_usb(local)
+    eng = fv.Engine(local, False, True)
+    eng.precheck()
+    eng.scan(log)
+    checks["detected"] = sum(1 for i in eng.items if i["verdict"] == "恶意")
+    checks["quarantined"] = eng.clean(log)["moved"]
+
+    # 系统关键路径：同一批样本打标后只报告，不隔离、不触发强杀
+    guard = os.path.join(tmp, "system_guard")
+    fixtures.build_infected_usb(guard)
+    orig_guard = fv.is_system_protected
+    fv.is_system_protected = lambda p: True
+    try:
+        eng2 = fv.Engine(guard, False, True)
+        eng2.scan(log)
+        checks["guard_reported"] = eng2.meta["system_protected_reported"]
+        checks["guard_quarantined"] = eng2.clean(log)["moved"]
+    finally:
+        fv.is_system_protected = orig_guard
+
+    ok = (checks["default_allow_fixed"] and checks["display_text"]
+          and checks.get("system_drive_allowed") is True
+          and checks["detected"] > 0 and checks["quarantined"] > 0
+          and checks["guard_reported"] > 0 and checks["guard_quarantined"] == 0)
+    return ok, checks, tmp
+
+
 def exe_info():
     dist = os.path.join(ROOT, "dist")
     out = {"exe_built": None, "exe_bytes": None}

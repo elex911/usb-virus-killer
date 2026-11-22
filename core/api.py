@@ -48,7 +48,7 @@ class Context:
 
     target: str = ""
     is_drive: bool = False
-    allow_fixed: bool = False
+    allow_fixed: bool = True   # 本地固定磁盘与系统盘默认可查杀；处置另有护栏
     app_dir: str = ""
     pick: str = ""                         # 由 Action.prompt=directory 预选的目录
     settings: Dict[str, Any] = field(default_factory=dict)
@@ -68,7 +68,7 @@ class ModuleBase:
     def actions(self) -> List[Action]:
         return []
 
-    def prepare_context(self, ctx: Context, raw_target: str, allow_fixed: bool = False) -> bool:
+    def prepare_context(self, ctx: Context, raw_target: str, allow_fixed: bool = True) -> bool:
         """把界面上的目标文本解析进 ctx。返回 False 表示目标无效。"""
         ctx.target = (raw_target or "").strip().strip('"')
         ctx.is_drive = False

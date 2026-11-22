@@ -36,6 +36,43 @@ DRIVE_TYPES = {
 # 隔离区目录前缀：扫描剪枝与 clean 建目录同源（界面提示文案单独保留字面量）
 QUARANTINE_PREFIX = "__WORM_QUARANTINE_"
 
+# 系统关键路径护栏：扫描照常报告，但绝不隔离、绝不改隐藏属性、绝不作为强杀确证锚点。
+# 判定只看路径层级，与盘符无关（D:\Windows 同样保护）；大小写与斜杠统一后再比对。
+SYSTEM_PROTECTED_DIRS = frozenset({
+    "windows", "program files", "program files (x86)", "programdata",
+    "system volume information", "$recycle.bin", "recovery", "boot",
+    "efi", "$windows.~ws", "$windows.~bt",
+})
+SYSTEM_PROTECTED_FILES = frozenset({
+    "pagefile.sys", "hiberfil.sys", "swapfile.sys", "dumpstack.log.tmp",
+    "bootmgr", "bootsect.bak", "ntldr", "ntdetect.com",
+})
+
+
+def is_system_protected(path):
+    """路径是否落在系统关键区域；不可读/异常按「不保护」处理，不改变既有判据。"""
+    try:
+        p = os.path.normcase(os.path.abspath(path)).lower().replace("/", "\\")
+    except Exception:
+        return False
+    _drive, tail = os.path.splitdrive(p)
+    parts = [x for x in tail.split("\\") if x]
+    if not parts:
+        return False
+    if parts[0] in SYSTEM_PROTECTED_DIRS:
+        return True
+    if len(parts) == 1 and parts[0] in SYSTEM_PROTECTED_FILES:
+        return True
+    return False
+
+
+def is_system_drive_target(target, is_drive=False):
+    """目标是否为系统盘根（盘符模式）；目录模式不做系统盘声明。"""
+    if not is_drive:
+        return False
+    sysdrive = os.path.splitdrive(os.environ.get("SystemDrive", "C:"))[0].upper() + "\\"
+    return (target or "").upper().rstrip("\\") == sysdrive.rstrip("\\")
+
 try:
     k32 = ctypes.windll.kernel32
     k32.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
@@ -152,7 +189,7 @@ def lnk_target_and_suspect(path):
 class Engine:
     """查杀引擎：与原版判定/隔离/回滚口径一致。"""
 
-    def __init__(self, root, is_drive, allow_fixed=False):
+    def __init__(self, root, is_drive, allow_fixed=True):
         self.root = root
         self.is_drive = is_drive
         self.allow_fixed = allow_fixed
@@ -167,18 +204,20 @@ class Engine:
             dt = drive_type(self.root)
             self.meta["drive_type"] = DRIVE_TYPES.get(dt, str(dt))
             sysdrive = os.path.splitdrive(os.environ.get("SystemDrive", "C:"))[0].upper() + "\\"
-            if self.root.upper() == sysdrive.upper():
-                raise RuntimeError("安全拦截：目标是系统盘 " + self.root + "，拒绝处理。")
+            # 系统盘不再整体拦截：本地磁盘查杀为一等公民；
+            # 风险由「系统关键路径不隔离 + 处置前二次确认」两道护栏承担。
+            self.meta["is_system_drive"] = self.root.upper() == sysdrive.upper()
             if dt not in (2, 3):
                 raise RuntimeError(
                     "安全拦截：目标类型「%s」不支持（仅可移动盘/本地盘）。" % DRIVE_TYPES.get(dt, dt)
                 )
             if dt == 3 and not self.allow_fixed:
                 raise RuntimeError(
-                    "安全拦截：%s 被识别为本地固定磁盘。\n若确为移动硬盘，请勾选「允许固定磁盘」后重试。" % self.root
+                    "安全拦截：%s 被识别为本地固定磁盘。\n如需查杀本地磁盘，请勾选「允许本地固定磁盘」后重试。" % self.root
                 )
         else:
             self.meta["drive_type"] = "目录(高级模式)"
+            self.meta["is_system_drive"] = False
             self.meta["warning"] = "目录模式：请确认路径无误，本模式绕过盘符类型校验。"
 
     def scan(self, log):
@@ -260,6 +299,16 @@ class Engine:
                 "kind": "可疑脚本", "verdict": "可疑", "path": p,
                 "detail": os.path.basename(p), "reason": "浅层目录的可疑脚本（默认不隔离）",
             })
+
+        # 系统关键路径照常计入报告，但打标；clean / 强杀据此跳过，绝不修改这些文件。
+        for i in self.items:
+            i["system_protected"] = is_system_protected(i["path"])
+        self.meta["system_protected_reported"] = sum(
+            1 for i in self.items if i.get("system_protected")
+        )
+        if self.meta["system_protected_reported"]:
+            log("系统关键路径命中 %d 项：仅报告，不隔离、不改属性。"
+                % self.meta["system_protected_reported"])
 
         mal = sum(1 for i in self.items if i["verdict"] == "恶意")
         sus = sum(1 for i in self.items if i["verdict"] == "可疑")
@@ -436,7 +485,17 @@ class Engine:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         qdir = os.path.join(self.root, QUARANTINE_PREFIX + stamp)
         os.makedirs(qdir, exist_ok=True)
-        targets = [i for i in self.items if i["verdict"] == "恶意"]
+        targets = []
+        protected = []
+        for i in self.items:
+            if i["verdict"] != "恶意":
+                continue
+            if i.get("system_protected") or is_system_protected(i["path"]):
+                protected.append(i["path"])
+                log("系统保护：跳过隔离 %s（仅报告，文件未改动）" % i["path"])
+                continue
+            targets.append(i)
+        self.meta["system_protected_skipped_quarantine"] = len(protected)
         manifest = {"schema_version": 2, "tool": "usb-virus-killer v2.0",
                     "time": datetime.now().isoformat(), "root": os.path.abspath(self.root), "items": []}
 
@@ -491,6 +550,11 @@ class Engine:
                 if not os.path.exists(p):
                     continue
                 if os.path.normcase(os.path.abspath(p)).startswith(os.path.normcase(os.path.abspath(qdir))):
+                    continue
+                # 系统文件（pagefile.sys / bootmgr 等）即使带隐藏+系统属性也不改，
+                # 否则可能破坏启动链；扫描报告仍会列出。
+                if is_system_protected(p):
+                    log("系统保护：跳过解除隐藏属性 %s（文件未改动）" % p)
                     continue
                 ok, msg = clear_hidden_system(p)
                 if ok and msg == "已解除":
@@ -657,7 +721,16 @@ class Module(ModuleBase):
         ]
 
     def action_confirm(self, action_id, ctx, log=lambda m: None):
-        """回滚前展示隔离清单摘要（含 SHA-256 取证说明）；读不到清单则退回静态确认。"""
+        """系统盘处置二次确认；回滚前展示隔离清单摘要（含 SHA-256 取证说明）。"""
+        if action_id in ("clean", "immunize"):
+            root, is_drive = norm_target(getattr(ctx, "target", ""))
+            if is_system_drive_target(root, is_drive):
+                return (
+                    "警告：目标是系统盘 %s。\n"
+                    "Windows / Program Files / ProgramData / 页面文件等系统关键路径"
+                    "只列入报告，不会被隔离或改属性。\n"
+                    "其余命中项仍会隔离并保留 SHA-256 清单，可回滚。\n\n确认继续？" % root
+                )
         if action_id != "restore" or not getattr(ctx, "pick", ""):
             return None
         try:
@@ -674,7 +747,7 @@ class Module(ModuleBase):
                "、".join(s["sources"]) or "见清单")
         )
 
-    def prepare_context(self, ctx, raw_target, allow_fixed=False):
+    def prepare_context(self, ctx, raw_target, allow_fixed=True):
         path, is_drive = norm_target(raw_target)
         if not path:
             return False

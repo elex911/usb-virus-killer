@@ -356,7 +356,7 @@ class Module(ModuleBase):
             Action("fp_view", "查看误报记录", target_mode="none", order=70),
         ]
 
-    def prepare_context(self, ctx, raw_target, allow_fixed=False):
+    def prepare_context(self, ctx, raw_target, allow_fixed=True):
         path, is_drive = fv.norm_target(raw_target)
         if not path:
             return False

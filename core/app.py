@@ -63,24 +63,24 @@ class App:
         ttk.Label(frm, text="模块化病毒查杀工具", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
             frm,
-            text="功能全部由模块提供：U盘查杀、主机诊断……后续新增功能只需放入 plugins 目录的模块文件。",
+            text="功能全部由模块提供：U盘/本地磁盘查杀、主机诊断……后续新增功能只需放入 plugins 目录的模块文件。",
             foreground="#555",
         ).pack(anchor="w", pady=(2, 10))
 
-        top = ttk.LabelFrame(frm, text="目标位置（文件类模块使用）", padding=10)
+        top = ttk.LabelFrame(frm, text="目标位置（盘符或目录，文件类模块共用）", padding=10)
         top.pack(fill="x")
         self.target = tk.StringVar()
         self.cb = ttk.Combobox(top, textvariable=self.target, width=52)
         self.cb.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Button(top, text="刷新盘符", command=self._refresh_drives).grid(row=0, column=1, padx=4)
         ttk.Button(top, text="选择目录…", command=self._pick_dir).grid(row=0, column=2, padx=4)
-        self.allow_fixed = tk.BooleanVar(value=False)
+        self.allow_fixed = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            top, text="允许固定磁盘（移动硬盘被误识别时勾选）",
+            top, text="允许本地固定磁盘（含系统盘；处置前另行确认）",
             variable=self.allow_fixed,
         ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
         top.columnconfigure(0, weight=1)
-        self.info = ttk.Label(top, text="当前无 U 盘插入；可先选目录做扫描测试。", foreground="#888")
+        self.info = ttk.Label(top, text="可选本地磁盘或目录；系统盘可查杀，受保护目录不会被隔离。", foreground="#888")
         self.info.grid(row=2, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         # 操作区：完全由模块的 actions() 生成

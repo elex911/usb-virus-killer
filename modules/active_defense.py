@@ -344,8 +344,8 @@ class Module(ModuleBase):
                            "执行前备份可回滚。继续？"),
         ]
 
-    def prepare_context(self, ctx, raw_target, allow_fixed=False):
-        """复用 folder_virus 的目标解析（兼容 'E:  [U盘]' 展示文本）。"""
+    def prepare_context(self, ctx, raw_target, allow_fixed=True):
+        """复用 folder_virus 的目标解析（兼容 'C:  [本地固定磁盘]' 展示文本）。"""
         try:
             from modules import folder_virus as fv
             root, is_drive = fv.norm_target(raw_target)
@@ -353,7 +353,20 @@ class Module(ModuleBase):
             root, is_drive = None, False
         ctx.target = root or (raw_target or "").strip()
         ctx.is_drive = bool(is_drive)
+        ctx.allow_fixed = bool(allow_fixed)
         return bool(ctx.target)
+
+    def action_confirm(self, action_id, ctx, log=lambda m: None):
+        if action_id in ("kill", "clean_persist"):
+            from modules import folder_virus as fv
+            root, is_drive = fv.norm_target(getattr(ctx, "target", ""))
+            if fv.is_system_drive_target(root, is_drive):
+                return (
+                    "警告：取证目标为系统盘 %s。\n"
+                    "系统关键路径下的确证锚点已排除，不会触发强杀或持久化清理；"
+                    "其余命中仍按原安全规则处理。\n\n确认继续？" % root
+                )
+        return None
 
     @staticmethod
     def _confirmed_from_target(ctx, log=lambda m: None):
@@ -363,9 +376,15 @@ class Module(ModuleBase):
         """
         from modules import folder_virus as fv
         eng = fv.Engine(ctx.target, getattr(ctx, "is_drive", False),
-                        getattr(ctx, "allow_fixed", False))
+                        getattr(ctx, "allow_fixed", True))
         eng.scan(log)
-        return confirmed_targets(eng.items)
+        safe_items = []
+        for item in eng.items:
+            if item.get("system_protected") or fv.is_system_protected(item["path"]):
+                log("系统保护：确证锚点 %s 仅报告，不触发强杀/持久化清理。" % item["path"])
+                continue
+            safe_items.append(item)
+        return confirmed_targets(safe_items)
 
     def run(self, action_id, ctx, log):
         confirmed = self._confirmed_from_target(ctx, log)

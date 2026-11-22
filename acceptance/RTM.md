@@ -8,7 +8,7 @@
 
 | ID | 需求条目 | 验证用例（pytest / 测试台场景） | 证据（2026-11-22 实测） | 结论 |
 |---|---|---|---|---|
-| FR-01 | 模块化架构：7 内置模块注册 + 插件热加载 | test_discovery / test_plugin_hot_discovery / 测试台14 GUI装配 | pytest 19/19；testbed 18/18 | 通过 |
+| FR-01 | 模块化架构：8 内置模块注册 + 插件热加载 | test_discovery / test_plugin_hot_discovery / 测试台14 GUI装配 | pytest 34/34；testbed 19/19（2026-11-22 本地磁盘改动后复测） | 通过 |
 | FR-02 | 感染判定：文件夹病毒双置信判定（TP/FP/FN 计数） | test_engine_and_rollback / 场景02 感染盘扫描、场景03 干净盘误报 | 场景02-03 PASS | 通过 |
 | FR-03 | 查杀隔离（只隔离不删除，含 manifest 清单） | test_engine_and_rollback / 场景04 | 场景04 PASS | 通过 |
 | FR-04 | 回滚还原：路径穿越/绝对路径拒绝、目标已存在不覆盖 | test_restore_safety 场景一 / 场景05 | pytest 通过；场景05 PASS | 通过 |
@@ -30,6 +30,8 @@
 | FR-20 | 契约化报告导出（report_export 钩子，7 模块覆盖） | test_report_export_contract | pytest 通过 | 通过 |
 | FR-21 | GUI 装配：视图/按钮/作者信息（掩码 180******66） | test_gui_assembly / 场景14 | pytest 通过；场景14 PASS | 通过 |
 | FR-22 | 异常路径优雅失败（坏目标/锁定文件/损坏规则库） | — / 场景17、18 | 两场景 PASS | 通过 |
+| FR-23 | 本地磁盘（含系统盘）查杀：默认放行、展示文本解析、系统盘预检、二次确认 | test_local_disk_defaults_and_display_text / test_system_drive_precheck_allowed / test_system_drive_action_confirmation / 场景19 | pytest 通过；场景19 PASS：`default_allow_fixed=true, display_text=true, system_drive_allowed=true` | 通过 |
+| FR-24 | 系统关键路径护栏：只报告，不隔离、不改属性、不作强杀锚点 | test_system_protected_path_rules / test_system_protected_never_quarantined / 场景19 | pytest 通过；场景19 PASS：`guard_reported=6, guard_quarantined=0`；本地样本 `detected=5, quarantined=5` 证明非全局拒绝 | 通过 |
 
 ## 二、红线需求（AGENTS.md，行为级验证）
 
@@ -40,7 +42,8 @@
 | NR-03 | 不碰真实恶意样本 | fixtures.py 仅合成样本 + EICAR；testbed 全程未引入外部样本 | 通过 |
 | NR-04 | 隐私：全库无完整手机号字面量 | grep 全号 = 0 命中（2026-11-22 复查，verify 脚本与 RTM 引用已改分段拼出）；exe 内嵌字节码校验 全号=0/掩码=1 VERIFY PASS | 通过 |
 | NR-05 | 报告只读诊断为主，修复全注释 | test_fixscript 断言注释率；场景16 | 通过 |
-| NR-06 | 文档-代码-spec 三向一致 | hidden-import 7==7；模块表 7==7；打包命令与 spec 一致 | 通过 |
+| NR-06 | 文档-代码-spec 三向一致 | hidden-import 8==8；模块表 8==8；打包命令与 spec 一致 | 通过 |
+| NR-07 | 系统盘不误伤：关键路径只报告，不隔离/不改属性/不作强杀锚点 | AGENTS.md 红线8；test_system_protected_never_quarantined；场景19 接缝注入 | 通过 |
 
 ## 二·补、删除调用精确核查（NR-01 佐证）
 
@@ -51,9 +54,10 @@
 
 ## 三、覆盖率统计
 
-- 功能需求 FR：22/22 映射到至少 1 个可执行用例（100%）
-- 红线需求 NR：6/6 有行为级验证（100%）
-- 验证资产：pytest 19 用例 + 测试台 18 场景（编号已修正为连续 01-18）
+- 功能需求 FR：24/24 映射到至少 1 个可执行用例（100%）
+- 红线需求 NR：7/7 有行为级验证（100%）
+- 验证资产：pytest 34 用例 + 测试台 19 场景（编号连续 01-19）
+- 2026-11-22 本地磁盘改动补充证据：`pytest 34 passed`、`testbed 19/19 PASS`、直接运行测试脚本 `ALL PASS`；场景19 数据见 FR-23/FR-24 证据栏。
 
 ## 四、验收过程发现并当场修正
 

@@ -1714,6 +1714,109 @@ def test_active_defense_safety():
         shutil.rmtree(t3, ignore_errors=True)
 
 
+# ---------------- 本地磁盘 / 系统盘查杀 ----------------
+
+def test_local_disk_defaults_and_display_text():
+    """本地固定磁盘默认放行；下拉展示文本所有模块都能解析为盘符根。"""
+    assert Context().allow_fixed is True
+    mods, errors = load_modules()
+    assert not errors
+    for mod in mods:
+        # 无目标模块沿用基类默认实现，主程序根本不会调它的 prepare_context
+        if type(mod).prepare_context is ModuleBase.prepare_context:
+            continue
+        c = Context()
+        assert mod.prepare_context(c, "D:  [本地固定磁盘]"), mod.meta["id"]
+        assert c.target == "D:" + chr(92), (mod.meta["id"], c.target)
+        assert c.is_drive is True, mod.meta["id"]
+        assert c.allow_fixed is True, mod.meta["id"]
+    print("[OK] 全模块默认允许本地固定磁盘，兼容下拉展示文本")
+
+
+def test_system_drive_precheck_allowed():
+    """系统盘根可被预检；只有手动取消「允许本地固定磁盘」才拦截。"""
+    sysroot = os.path.splitdrive(os.environ.get("SystemDrive", "C:"))[0].upper() + chr(92)
+    orig = fv.drive_type
+    fv.drive_type = lambda root: 3
+    try:
+        eng = fv.Engine(sysroot, True, True)
+        eng.precheck()
+        assert eng.meta["is_system_drive"] is True
+        assert fv.is_system_drive_target(sysroot, True) is True
+        blocked = fv.Engine(sysroot, True, False)
+        try:
+            blocked.precheck()
+            raise AssertionError("取消本地磁盘开关时应拦截")
+        except RuntimeError:
+            pass
+    finally:
+        fv.drive_type = orig
+    print("[OK] 系统盘允许查杀预检，开关关闭时仍拦截")
+
+
+def test_system_protected_path_rules():
+    s = chr(92)
+    assert fv.is_system_protected("C:" + s + "Windows" + s + "notepad.exe")
+    assert fv.is_system_protected("C:" + s + "Program Files" + s + "app.exe")
+    assert fv.is_system_protected("C:" + s + "ProgramData" + s + "x.dat")
+    assert fv.is_system_protected("D:" + s + "pagefile.sys")
+    assert fv.is_system_protected("D:" + s + "$Recycle.Bin" + s + "x")
+    assert not fv.is_system_protected("C:" + s + "Users" + s + "a" + s + "photo.lnk")
+    assert not fv.is_system_protected("D:" + s + "usb" + s + "autorun.inf")
+    print("[OK] 系统关键路径判定：目录/文件/盘符无关")
+
+
+def test_system_protected_never_quarantined():
+    """受保护路径照常报告，但不搬移、不改隐藏属性。"""
+    from modules import active_defense as ad
+    tmp = tempfile.mkdtemp(prefix="fk_sysprot_", dir=ROOT)
+    orig = fv.is_system_protected
+    fv.is_system_protected = lambda path: True
+    try:
+        auto = os.path.join(tmp, "autorun.inf")
+        with open(auto, "w", encoding="utf-8") as f:
+            f.write("[autorun]")
+        hidden = os.path.join(tmp, "orig.jpg")
+        with open(hidden, "wb") as f:
+            f.write(b"sample")
+        fv.set_attr(hidden, fv.FILE_ATTRIBUTE_HIDDEN | fv.FILE_ATTRIBUTE_SYSTEM)
+
+        eng = fv.Engine(tmp, False, True)
+        eng.scan(lambda m: None)
+        assert eng.meta["system_protected_reported"] >= 1
+        result = eng.clean(lambda m: None)
+        assert os.path.exists(auto), "受保护的 autorun.inf 不得被隔离"
+        assert result["moved"] == 0
+        assert eng.meta["system_protected_skipped_quarantine"] >= 1
+        assert (fv.get_attr(hidden) or 0) & fv.FILE_ATTRIBUTE_HIDDEN, \
+            "受保护文件的隐藏属性不得被修改"
+
+        logs = []
+        confirmed = ad.Module._confirmed_from_target(Context(target=tmp), logs.append)
+        assert not confirmed, "受保护锚点不得进入强杀确证集"
+        assert any("系统保护" in line for line in logs)
+    finally:
+        fv.is_system_protected = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("[OK] 系统保护：不隔离、不改属性、不触发强杀")
+
+
+def test_system_drive_action_confirmation():
+    """系统盘处置有动态警告；其他盘沿用原静态确认。"""
+    from modules import active_defense as ad
+    sysroot = os.path.splitdrive(os.environ.get("SystemDrive", "C:"))[0].upper() + chr(92)
+    other = "D:" + chr(92)
+    sys_ctx = Context(target=sysroot, is_drive=True)
+    other_ctx = Context(target=other, is_drive=True)
+    for mod, aid in ((fv.Module(), "clean"), (fv.Module(), "immunize"),
+                     (ad.Module(), "kill"), (ad.Module(), "clean_persist")):
+        text = mod.action_confirm(aid, sys_ctx)
+        assert text and "系统盘" in text, (mod.meta["id"], aid)
+        assert mod.action_confirm(aid, other_ctx) is None, (mod.meta["id"], aid)
+    assert fv.Module().action_confirm("scan", sys_ctx) is None
+    print("[OK] 系统盘处置二次确认，非系统盘不受影响")
+
+
 if __name__ == "__main__":
     test_discovery()
     test_plugin_hot_discovery()
@@ -1732,4 +1835,9 @@ if __name__ == "__main__":
     test_fixscript()
     test_gui_assembly()
     test_active_defense_safety()
+    test_local_disk_defaults_and_display_text()
+    test_system_drive_precheck_allowed()
+    test_system_protected_path_rules()
+    test_system_protected_never_quarantined()
+    test_system_drive_action_confirmation()
     print("ALL PASS")

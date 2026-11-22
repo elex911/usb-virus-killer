@@ -135,12 +135,15 @@ class Module(ModuleBase):
                    order=10),
         ]
 
-    def prepare_context(self, ctx, raw_target, allow_fixed=False):
-        path = (raw_target or "").strip().strip('"')
+    def prepare_context(self, ctx, raw_target, allow_fixed=True):
+        # 统一走 folder_virus 的目标解析：兼容下拉框的 "C:  [本地固定磁盘]" 展示文本，
+        # 否则展示文本会被当成目录路径，系统盘/本地盘扫描直接失效。
+        from . import folder_virus as fv
+        path, is_drive = fv.norm_target(raw_target)
         if not path:
             return False
         ctx.target = path
-        ctx.is_drive = len(path) == 2 and path[1] == ":"
+        ctx.is_drive = bool(is_drive)
         ctx.allow_fixed = bool(allow_fixed)
         return True
 

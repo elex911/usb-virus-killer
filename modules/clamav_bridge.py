@@ -209,7 +209,7 @@ class Module(ModuleBase):
                    target_mode="required", order=30),
         ]
 
-    def prepare_context(self, ctx, raw_target, allow_fixed=False):
+    def prepare_context(self, ctx, raw_target, allow_fixed=True):
         path, is_drive = fv.norm_target(raw_target)
         if not path:
             return False

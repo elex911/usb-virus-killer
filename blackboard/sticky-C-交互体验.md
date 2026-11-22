@@ -4,7 +4,7 @@
 
 ### 界面流程（core/app.py）
 - 首启动动线完整：加载模块→自动刷新盘符（app.py:45）→无 U 盘时提示「未发现可处理盘符；可先选目录做测试」（app.py:166）→未选目标点扫描报中文引导「请先选择目标盘符或目录」（app.py:209）。
-- 盘符下拉由各模块 suggest_targets() 汇总并按规范化文本去重（app.py:143-154）；「允许固定磁盘」勾选透传 prepare_context（app.py:75-79, 204）。
+- 盘符下拉由各模块 suggest_targets() 汇总并按规范化文本去重，包含 U 盘与本地固定盘（app.py:141-170）；「允许本地固定磁盘」默认勾选并透传 prepare_context（app.py:77-81, 206-218）；系统盘处置另有二次确认，关键路径只报告不隔离。
 - 标签页/按钮完全由模块生成：操作区 3 列网格（app.py:88-98），signature_db 有 7 个按钮排 2 列×4 行（app.py:98 + modules/signature_db.py:336-354）；模块视图加载失败有中文兜底（app.py:117）。
 - 忙态管理：执行中禁用全部按钮、状态栏「处理中…」（app.py:179-187），后台线程+queue 轮询防 tkinter 线程不安全（app.py:235, 258-293）。
 - 报告导出仅 JSON 一种格式（app.py:300），含 module_results 及 v1.x 兼容字段（app.py:303-339）。
@@ -22,7 +22,7 @@
 - README.md 为精简版，模块表不全（见三）。
 
 ### 打包与产物
-- spec 隐藏导入覆盖全部 7 个内置模块+core 三件（文件夹病毒查杀工具.spec:9）；dist\ 有 11.6MB exe、signature_db.json 空库、plugins\_示例模块.py.template，与使用说明.md:13-14,80 所述一致（ls 佐证，T1）。
+- spec 隐藏导入覆盖全部 8 个内置模块+core 三件（文件夹病毒查杀工具.spec:9）；dist\ 有 11.6MB exe、signature_db.json 空库、plugins\_示例模块.py.template，与使用说明.md:13-14,80 所述一致（ls 佐证，T1）。
 - spec datas=[] 未捆绑 signature_db.json，靠外部文件交付——与文档口径自洽。
 
 ## 二、改进建议（先证伪后提）
