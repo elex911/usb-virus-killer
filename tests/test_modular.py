@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """模块化重构回归测试。运行：python tests/test_modular.py"""
+import io
 import json
 import os
 import shutil
@@ -1590,10 +1591,127 @@ def test_gui_assembly():
         hint = app.info.cget("text")
         assert hint.count("共 ") == 1 and "；共" not in hint, hint
         assert ("共 %d 个可处理盘符。" % len(drives)) in hint, hint
+
+        # 活动威胁处置模块必须真实可见（视图 + 强杀按钮），否则新增模块是哑的
+        assert "active_defense" in app.views, "活动威胁处置视图未创建"
+        assert any("强杀确证恶意进程树" == t for t in texts), "强杀按钮未出现在界面"
+
         print("[OK] GUI 装配: %d 视图 / %d 按钮；作者信息已显示；盘符 %d 项无重复，提示单一"
               % (len(app.views), len(app.all_buttons), len(values)))
     finally:
         root.destroy()
+
+
+def test_lnk_target_uppercase_drive():
+    """回归：真实 .lnk 里盘符是大写（E:\\），目标提取不得因大小写失效。
+
+    此 bug 会让 active_defense 的确证锚点错指向 .lnk 自身而非真实恶意 exe。
+    """
+    t = tempfile.mkdtemp(prefix="fk_lnktgt_", dir=ROOT)
+    try:
+        target = r"E:\malware.exe"
+        lnk = os.path.join(t, "x.lnk")
+        with open(lnk, "wb") as f:
+            f.write(target.encode("utf-16-le"))
+        got, _suspect = fv.lnk_target_and_suspect(lnk)
+        assert os.path.normcase(got) == os.path.normcase(target), \
+            "大写盘符目标应可提取，实际 %r" % got
+        print("[OK] .lnk 大写盘符目标提取: %s" % got)
+    finally:
+        shutil.rmtree(t, ignore_errors=True)
+
+
+def test_active_defense_safety():
+    """活动威胁处置：强杀只认确证恶意路径 + 系统白名单护栏 + 快照 + 持久化可回滚。
+
+    全部走接缝注入，绝不实际终止任何进程、绝不实际改注册表。
+    """
+    import modules.active_defense as ad
+
+    # ---- 场景一：确证目标提取——只取 verdict=恶意 的 .lnk 目标，不取可疑/正常 ----
+    items = [
+        {"kind": "快捷方式", "verdict": "恶意", "path": r"E:\a.lnk",
+         "detail": r"目标: E:\malware.exe", "reason": "确证"},
+        {"kind": "快捷方式", "verdict": "可疑", "path": r"E:\b.lnk",
+         "detail": r"目标: E:\maybe.exe", "reason": "待核"},
+        {"kind": "autorun.inf", "verdict": "恶意", "path": r"E:\autorun.inf", "detail": "x"},
+    ]
+    confirmed = ad.confirmed_targets(items)
+    assert os.path.normcase(r"E:\malware.exe") in confirmed, confirmed
+    assert os.path.normcase(r"E:\autorun.inf") in confirmed, confirmed
+    assert os.path.normcase(r"E:\maybe.exe") not in confirmed, "可疑项不得进入强杀锚点"
+    print("[OK] 确证锚点：只取恶意项，排除可疑/正常")
+
+    # ---- 场景二：只杀命中确证路径的进程；系统白名单即使命中也不杀 ----
+    protected = ad.SYSTEM_PROCESS_NAMES
+    procs = [
+        (100, 4, r"E:\malware.exe"),          # 确证恶意 → 杀
+        (101, 100, r"E:\child.exe"),          # 确证恶意进程的后代 → 杀
+        (200, 4, r"C:\Windows\explorer.exe"), # 白名单 → 不杀
+        (201, 4, r"E:\maybe.exe"),            # 疑点路径 → 不杀
+        (202, 4, r"C:\Windows\System32\svchost.exe"),  # 白名单 → 不杀
+    ]
+    victims = ad.plan_kill(procs, confirmed, protected)
+    assert victims == [100, 101], "只杀确证命中 + 其后代，且排除白名单: %r" % victims
+    print("[OK] 强杀计划：确证命中及其后代，白名单/疑点排除")
+
+    # ---- 场景三：可疑项无论如何都不进入强杀（元审查核心） ----
+    only_suspicious = ad.confirmed_targets([items[1]])
+    victims2 = ad.plan_kill(procs, only_suspicious, protected)
+    assert victims2 == [], "可疑项绝不能触发强杀: %r" % victims2
+    print("[OK] 疑点零强杀：只有可疑项时 victims 为空")
+
+    # ---- 场景四：快照落盘，含证据字段，原子写 ----
+    t = tempfile.mkdtemp(prefix="fk_active_", dir=ROOT)
+    try:
+        snap = os.path.join(t, "snapshot.json")
+        ad.write_snapshot(snap, [{
+            "pid": 100, "ppid": 4, "path": r"E:\malware.exe",
+            "evidence": "同名原文件被隐藏 + .lnk 伪装（确证特征）",
+        }])
+        data = json.load(io.open(snap, encoding="utf-8"))
+        assert len(data["processes"]) == 1
+        assert data["processes"][0]["pid"] == 100
+        assert "确证" in data["processes"][0]["evidence"]
+        assert data["processes"][0].get("time"), "快照必须有时间戳"
+        print("[OK] 快照落盘：PID/路径/证据/时间戳齐全")
+    finally:
+        shutil.rmtree(t, ignore_errors=True)
+
+    # ---- 场景五：持久化点只清指向确证恶意的项，先备份可回滚 ----
+    t2 = tempfile.mkdtemp(prefix="fk_persist_", dir=ROOT)
+    try:
+        points = [
+            {"id": "p1", "type": "run", "value": r"E:\malware.exe", "path": "HKCU\\...\\Run"},
+            {"id": "p2", "type": "run", "value": r"C:\Program Files\Normal\app.exe", "path": "HKCU\\...\\Run"},
+            {"id": "p3", "type": "wmi", "value": "cmd /c E:\\malware.exe", "path": "WMI:__EventFilter"},
+        ]
+        plan = ad.plan_persist_cleanup(points, confirmed)
+        assert [p["id"] for p in plan] == ["p1", "p3"], "只清指向确证恶意的持久化点: %r" % plan
+        backup = os.path.join(t2, "persist_backup.json")
+        ad.backup_persist(backup, plan)
+        b = json.load(io.open(backup, encoding="utf-8"))
+        assert len(b["items"]) == 2 and all("value" in i for i in b["items"]), "备份须留原值可回滚"
+        print("[OK] 持久化清理：只锁确证关联，备份保留原值")
+    finally:
+        shutil.rmtree(t2, ignore_errors=True)
+
+    # ---- 场景六：现场取证接线——不依赖 ctx.settings，自己扫描拿确证锚点 ----
+    t3 = tempfile.mkdtemp(prefix="fk_active_live_", dir=ROOT)
+    try:
+        original = os.path.join(t3, "照片.jpg")
+        with open(original, "wb") as f:
+            f.write(b"x" * 32)
+        fv.set_attr(original, fv.FILE_ATTRIBUTE_HIDDEN | fv.FILE_ATTRIBUTE_SYSTEM)
+        make_lnk(os.path.join(t3, "照片.lnk"), original)
+        ctx = Context(target=t3, is_drive=False, allow_fixed=True)
+        mod = ad.Module()
+        confirmed_live = mod._confirmed_from_target(ctx, lambda m: None)
+        assert os.path.normcase(original) in confirmed_live, \
+            "现场取证应拿到确证恶意目标: %r" % confirmed_live
+        print("[OK] 现场取证：自包含扫描拿确证锚点，不依赖跨模块隐式状态")
+    finally:
+        shutil.rmtree(t3, ignore_errors=True)
 
 
 if __name__ == "__main__":
@@ -1613,4 +1731,5 @@ if __name__ == "__main__":
     test_fp_feedback()
     test_fixscript()
     test_gui_assembly()
+    test_active_defense_safety()
     print("ALL PASS")

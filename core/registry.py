@@ -24,6 +24,7 @@ BUILTIN_MODULES = (
     "modules.clamav_bridge",
     "modules.modern_threats",
     "modules.amsi_scan",
+    "modules.active_defense",
 )
 
 

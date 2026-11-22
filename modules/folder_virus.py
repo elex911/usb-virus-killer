@@ -141,7 +141,9 @@ def lnk_target_and_suspect(path):
     t16 = raw.decode("utf-16-le", errors="ignore")
     t8 = raw.decode("latin-1", errors="ignore")
     combined = (t16 + "\n" + t8).lower()
-    paths = re.findall(r"[a-z]:\\[^\x00-\x1f]{1,180}", t16)
+    # 真实 .lnk 的盘符是大写（E:\），须忽略大小写匹配；但保留原文大小写供显示。
+    # 否则目标恒为空，下游会把 .lnk 自身误当确证锚点。
+    paths = re.findall(r"[a-z]:\\[^\x00-\x1f]{1,180}", t16, re.IGNORECASE)
     target = paths[0] if paths else ""
     suspect = any(tok in combined for tok in SUSPECT_TOKENS)
     return target, suspect

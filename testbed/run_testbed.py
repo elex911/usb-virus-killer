@@ -346,7 +346,10 @@ def s_gui(log):
             "combobox_count_matches_drives": len(values) == len(drives),
             "hint": hint,
         }
-        ok = (len(app.views) == 7 and author_ok
+        # 视图数随内置模块数增长，动态计算而非硬编码（新增模块不应让烟测假失败）
+        from core.registry import BUILTIN_MODULES
+        expected_views = len(BUILTIN_MODULES)
+        ok = (len(app.views) == expected_views and author_ok
               and len(values) == len(set(values)) == len(drives)
               and hint.count("；") == 0)
         return ok, checks, None
