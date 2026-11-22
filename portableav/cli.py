@@ -20,7 +20,22 @@ from . import paths as pathmod, pe as pemod, quarantine as qmod, report as repor
 from . import revoke, scan as scanmod, trust, workdir as workmod
 
 DEFAULT_RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.dirname(_PKG_DIR)
+
+
+def _app_root() -> str:
+    """程序根目录：绿包布局（含 runtime/ 或 run_portableav.bat）取上一级，否则取包目录。
+
+    决定了默认工作目录落在哪——不能让 _work 落进源码包里。
+    """
+    if (os.path.isdir(os.path.join(_PARENT, "runtime"))
+            or os.path.isfile(os.path.join(_PARENT, "run_portableav.bat"))):
+        return _PARENT
+    return _PKG_DIR
+
+
+APP_DIR = _app_root()
 
 
 def _plan_workdir(args, e, target: str = "") -> workmod.WorkdirPlan:

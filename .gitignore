@@ -22,6 +22,9 @@ signature_db.local.json
 # PortableAV runtime / output（工作目录、隔离区、报告均为运行产物）
 portableav/_work/
 portableav_rules_local/
+# 绿包构建产物（体积大、可由 tools/build_portable.py 重建）
+dist_portable/
+.workbuddy/build_portable/
 
 # Editor and OS
 .vscode/
