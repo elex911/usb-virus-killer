@@ -1,0 +1,36 @@
+{
+  "snapshot": "research/2026-11-22",
+  "created_utc": "2026-11-22T11:56:50Z",
+  "git": {
+    "rev": "dcc0fc771cd94bdff19c44d46ea4dfdc6cf84faf",
+    "short": "dcc0fc7",
+    "branch": "research/2026-11-22",
+    "subject": "本地磁盘可扫描：重建 exe，新增系统盘门禁用例与 exe 新鲜度校验"
+  },
+  "file_count": 43,
+  "total_bytes": 366600,
+  "artifacts_not_committed": {
+    "gui_exe": {
+      "path": "dist/文件夹病毒查杀工具.exe",
+      "size": 12480916,
+      "sha256": "2fbd7001efe1c197d1895210c6f43d86d738478f5235fa43aee99d8ec98fa30d",
+      "note": "已 gitignore，需用 spec 重建后用 check_exe_freshness 校验"
+    },
+    "green_package": {
+      "path": "dist_portable/PortableAV/",
+      "files": 224,
+      "source_sha256": "009d6bf7e3b2ddca3d784fa09f90fe54336d5b60f0e0f305c37f400bf83cfd3b",
+      "download": {
+        "bytes": 11249023,
+        "threads": 0,
+        "ranged": false,
+        "reused": true
+      },
+      "note": "目录形态绿包，不入库；用 tools/build_portable.py 重建"
+    }
+  },
+  "python": {
+    "version": "3.12.10"
+  },
+  "refreshed_reason": "补充 README.md / FINDINGS.md 后重算清单"
+}
