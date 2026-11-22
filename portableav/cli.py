@@ -18,6 +18,7 @@ from typing import List, Optional
 from . import catroot, chain as chainmod, drives, env as envmod, matcher as matchmod
 from . import paths as pathmod, pe as pemod, quarantine as qmod, report as reportmod
 from . import revoke, scan as scanmod, trust, workdir as workmod
+from . import __version__
 
 DEFAULT_RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rules")
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -68,7 +69,7 @@ def _load_blacklist(arg: Optional[str]) -> revoke.RevocationList:
 
 def cmd_env(args) -> int:
     e = envmod.detect()
-    print("运行模式：%s（%s）" % (e.mode, e.hint))
+    print("运行模式：%s" % e.hint)
     print("命中信号：%s" % (", ".join(e.signals) or "无"))
     for k, v in e.detail.items():
         print("  %-12s %s" % (k, v))
@@ -324,6 +325,203 @@ def cmd_verify(args) -> int:
     return 0 if bad == 0 else 1
 
 
+# ---------------------------------------------------------------------------
+# 交互模式
+#
+# 为什么需要：双击 .bat 等于「零参数」运行，argparse 打印用法后进程立即结束，
+# 控制台窗口随之关闭 —— 用户看到的就是「一闪而过」。
+# 所以无参数 + 真实终端时进入菜单；非终端（管道/CI）仍打印用法并非零退出，
+# 以免脚本里误用参数时被静默吞掉。
+# ---------------------------------------------------------------------------
+
+_MENU = """\
+------------------------------------------------------------------
+  [1] 环境信息：磁盘 / 离线系统盘 / 工作目录
+  [2] 扫描（演练，只看不处置）
+  [3] 扫描并隔离命中的恶意文件（需输入 yes 确认）
+  [4] 隔离区：清单 / 还原
+  [0] 退出
+------------------------------------------------------------------"""
+
+
+def _ask(ask_fn, prompt: str) -> Optional[str]:
+    """读一行；EOF（窗口被关掉、管道读尽）返回 None，不抛异常。"""
+    try:
+        return ask_fn(prompt)
+    except EOFError:
+        return None
+
+
+def _auto_target(e, systems) -> tuple:
+    """自动定位目标是否可用；返回 (目标, 不可用原因)。
+
+    常规 Windows 下 find_offline_systems 会把正在运行的系统（C:\\Windows）当成
+    「离线系统盘」。菜单里若照搬，双击的人会不明就里地扫系统盘、并把命中项送进
+    隔离区——那是处置正在使用的系统，不是取证。所以这条路径只在 PE 下放行。
+    """
+    if not systems:
+        return "", "未定位到离线系统盘（盘内可能没有 Windows 目录）"
+    if e is not None and not e.is_offline:
+        return "", ("当前是常规系统，自动定位到的是正在运行的系统（%s）；"
+                    "扫它既慢又可能把系统文件送进隔离区，请手动输入要检查的目录"
+                    % systems[0].windows_dir)
+    return systems[0].windows_dir, ""
+
+
+def _prompt_target(e, say, ask_fn, systems) -> Optional[str]:
+    auto, why = _auto_target(e, systems)
+    say("  自动定位：%s" % (auto if auto else "不可用 — " + why))
+    raw = _ask(ask_fn, "  目标目录（回车=自动，q=返回）：")
+    if raw is None:
+        return None
+    raw = raw.strip().strip('"')
+    if raw.lower() in ("q", "quit", "exit"):
+        return None
+    if not raw:
+        if not auto:
+            say("  ! %s" % why)
+            return None
+        return auto
+    if not os.path.isdir(raw):
+        say("  ! 目录不存在：%s" % raw)
+        return None
+    return os.path.normpath(os.path.abspath(raw))
+
+
+def _default_plan(e):
+    """交互模式下的工作目录（临时文件/隔离区/报告都落这里）。"""
+    if e is None:
+        return workmod.plan_workdir(app_dir=APP_DIR, system_drive="X:")
+    return _plan_workdir(build_parser().parse_args(["scan"]), e)
+
+
+def interactive(input_fn=None, out=None, env_obj=None) -> int:
+    """无参数启动时的菜单。任何异常都不许把窗口直接崩掉。"""
+    ask_fn = input_fn or input
+    out = out or sys.stdout
+
+    def say(msg: str = "") -> None:
+        print(msg, file=out)
+        try:
+            out.flush()
+        except Exception:
+            pass
+
+    e = env_obj
+    if e is None:
+        try:
+            e = envmod.detect()
+        except Exception as exc:            # 环境识别失败不该阻断菜单
+            say("[!] 环境识别失败：%s" % exc)
+
+    say("PortableAV %s —— 离线取证查杀（原型）" % __version__)
+    if e is not None:
+        say("运行模式：%s" % e.hint)
+
+    plan = _default_plan(e)
+    say("工作目录：%s" % plan.path)
+    if not plan.ok:
+        say("  ! 工作目录不可用：%s" % plan.reason)
+        say("    可设置环境变量 PAV_WORK 指向一块可写磁盘后重开。")
+
+    # 信任材料状态必须写在最前面：没有根证书时"白 0"不是扫描坏了，是设计如此。
+    try:
+        n_roots = len(_load_roots(None))
+    except Exception:
+        n_roots = 0
+    try:
+        rl = _load_blacklist(None)
+        revoke_txt = rl.summary() if rl else "未启用"
+    except Exception:
+        revoke_txt = "读取失败"
+    if n_roots:
+        say("信任材料：根证书 %d 张 ｜ 吊销 %s" % (n_roots, revoke_txt))
+    else:
+        say("信任材料：根证书 0 张 —— 所有文件一律不判白（降为待复核）")
+        say("          放入 %s 后重开（导出方法见 rules\\README.md）"
+            % os.path.join(DEFAULT_RULES, "roots"))
+
+    systems = []
+    try:
+        systems = drives.find_offline_systems(in_pe=bool(e is not None and e.is_offline))
+    except Exception as exc:
+        say("[!] 磁盘枚举失败：%s" % exc)
+
+    say()
+    while True:
+        say(_MENU)
+        raw = _ask(ask_fn, "请选择> ")
+        if raw is None:
+            say()
+            return 0
+        c = raw.strip().lower()
+        if c in ("", "0", "q", "quit", "exit"):
+            return 0
+
+        if c == "1":
+            try:
+                cmd_env(None)
+            except Exception as exc:
+                say("[!] %s: %s" % (type(exc).__name__, exc))
+            say()
+            continue
+
+        if c in ("2", "3"):
+            target = _prompt_target(e, say, ask_fn, systems)
+            if not target:
+                say()
+                continue
+            apply = c == "3"
+            if apply:
+                qdir = os.path.join(plan.path, "quarantine")
+                say()
+                say("  即将把命中的文件移入并加密：%s" % qdir)
+                say("  （可用 [4] 还原；但这是处置行为，会改动被检系统）")
+                conf = _ask(ask_fn, "  确认执行？输入 yes 继续：")
+                if conf is None or conf.strip().lower() not in ("yes", "y"):
+                    say("  已取消")
+                    say()
+                    continue
+            argv = ["scan", "--target", target, "--workdir", plan.path]
+            if apply:
+                argv += ["--apply", "--quarantine", os.path.join(plan.path, "quarantine")]
+            say()
+            try:
+                cmd_scan(build_parser().parse_args(argv))
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                say("[!] 扫描失败：%s: %s" % (type(exc).__name__, exc))
+            say()
+            continue
+
+        if c == "4":
+            qdir = os.path.join(plan.path, "quarantine")
+            say("  隔离区：%s" % qdir)
+            if not os.path.isdir(qdir):
+                say("  （不存在，说明还没有隔离过文件）")
+                say()
+                continue
+            try:
+                cmd_list(build_parser().parse_args(["list", "--quarantine", qdir]))
+            except Exception as exc:
+                say("[!] %s: %s" % (type(exc).__name__, exc))
+                say()
+                continue
+            rid = _ask(ask_fn, "  输入要还原的隔离 ID（回车返回）：")
+            if rid and rid.strip() and rid.strip().lower() not in ("q", "quit"):
+                try:
+                    cmd_restore(build_parser().parse_args(
+                        ["restore", "--quarantine", qdir, "--id", rid.strip()]))
+                except Exception as exc:
+                    say("[!] %s: %s" % (type(exc).__name__, exc))
+            say()
+            continue
+
+        say("  未知选项：%s" % c)
+        say()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="portableav",
                                 description="PortableAV 离线取证查杀（原型）")
@@ -381,11 +579,38 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _want_interactive() -> bool:
+    """是否进入交互菜单：显式环境变量优先，其次看是不是真实终端。
+
+    PAV_INTERACTIVE 既方便在管道里测试菜单，也给「快捷方式带不了参数」的场景留出口。
+    """
+    if os.environ.get("PAV_INTERACTIVE", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty())
+    except Exception:
+        return False
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    if not argv:
+        if _want_interactive():
+            try:
+                return interactive()
+            except KeyboardInterrupt:
+                print("\n已退出")
+                return 130
+        build_parser().print_help()
+        print()
+        print("未指定子命令。交互菜单需要真实终端（或设 PAV_INTERACTIVE=1）。")
+        return 2
+
     args = build_parser().parse_args(argv)
     if not getattr(args, "func", None):
         build_parser().print_help()
-        return 0
+        return 2
     try:
         return args.func(args)
     except KeyboardInterrupt:

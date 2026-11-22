@@ -205,10 +205,10 @@ def build(args) -> int:
     os.makedirs(work, exist_ok=True)
 
     step("准备输出目录：%s" % out_dir)
+    rc = _guard_overwrite(out_dir, args.force, args.discard_work)
+    if rc is not None:
+        return rc
     if os.path.isdir(out_dir):
-        if not args.force:
-            warn("输出目录已存在，加 --force 覆盖：%s" % out_dir)
-            return 2
         shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
@@ -350,6 +350,51 @@ def build(args) -> int:
     return 0
 
 
+def _quarantine_pending(qdir: str) -> int:
+    """统计隔离区里还没还原的条目数，用于阻止 --force 误删样本。
+
+    清单可读时按 status 统计；清单损坏或缺失时退回数密文文件——因为没有别的
+    证据能证明"这里没有东西"，此时偏保守（宁可拦一次）。
+    """
+    if not os.path.isdir(qdir):
+        return 0
+    manifest = os.path.join(qdir, "manifest.json")
+    if os.path.isfile(manifest):
+        try:
+            with open(manifest, encoding="utf-8") as f:
+                data = json.load(f)
+            items = data.get("items", [])
+            pending = [it for it in items
+                       if str(it.get("status", "")).lower() in ("stored", "pending")]
+            return len(pending)
+        except Exception:
+            pass
+    items_dir = os.path.join(qdir, "items")
+    if os.path.isdir(items_dir):
+        return len([n for n in os.listdir(items_dir) if n.lower().endswith(".qbin")])
+    return 0
+
+
+def _guard_overwrite(out_dir: str, force: bool, discard_work: bool) -> Optional[int]:
+    """覆盖输出目录前的检查。返回 None 表示放行，否则是要返回的退出码。"""
+    if not os.path.isdir(out_dir):
+        return None
+    if not force:
+        warn("输出目录已存在，加 --force 覆盖：%s" % out_dir)
+        return 2
+    # --force 会删掉整个输出目录。而默认工作目录（含加密隔离区、报告）就住在
+    # <out>_work 里，无提示地删等于销毁已隔离样本、且无法再还原。
+    pending = _quarantine_pending(os.path.join(out_dir, "_work", "quarantine"))
+    if pending and not discard_work:
+        warn("拒绝覆盖：输出目录内隔离区还有 %d 项未还原的样本" % pending)
+        warn("  路径：%s" % os.path.join(out_dir, "_work", "quarantine"))
+        warn("  先还原或备份；确认要丢弃这些样本再加 --discard-work")
+        return 3
+    if pending:
+        warn("按 --discard-work 丢弃隔离区 %d 项样本" % pending)
+    return None
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="构建 PortableAV 绿包（embeddable，无安装）")
     ap.add_argument("--out", default="", help="输出目录，默认 dist_portable/PortableAV")
@@ -358,6 +403,8 @@ def main(argv=None) -> int:
     ap.add_argument("--host-python", default="", help="用于下载 wheel 的宿主 python")
     ap.add_argument("--skip-download", action="store_true", help="复用已下载归档")
     ap.add_argument("--force", action="store_true", help="覆盖已存在的输出目录")
+    ap.add_argument("--discard-work", action="store_true",
+                    help="允许 --force 连带删除输出目录内的隔离区样本（默认拒绝）")
     return build(ap.parse_args(argv))
 
 
