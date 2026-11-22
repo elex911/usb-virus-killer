@@ -360,6 +360,13 @@ def test_find_offline_systems_multi_boot_dirs():
     assert all(s.complete for s in found)
 
 
+def test_windowsapps_not_a_system_candidate():
+    """WindowsApps 不是系统目录，不得进入候选（避免无谓 stat 与误报）。"""
+    certs = drives.candidate_windows_dirs(
+        "D:", subdirs=lambda p: ["Windows", "Windows.old", "WindowsApps", "Users"])
+    assert [os.path.basename(c) for c in certs] == ["Windows", "Windows.old"]
+
+
 def test_find_offline_systems_empty_is_allowed():
     """找不到目标必须返回空，由调用方决定怎么提示——绝不自动猜一个盘。"""
     assert drives.find_offline_systems(_fake_pool(), exists=lambda p: False,

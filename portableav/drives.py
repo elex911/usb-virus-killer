@@ -101,7 +101,11 @@ def candidate_windows_dirs(
     lister = subdirs or _list_subdirs
     root = drive.rstrip("\\") + "\\"
     names = lister(root)
-    picked = [n for n in names if n.lower() == "windows" or n.lower().startswith("windows")]
+    # 名字以 windows 开头即可（覆盖 Windows / Windows.old / Windows10），
+    # 但 WindowsApps 是应用商店目录，不含系统内核，直接排除
+    picked = [n for n in names
+              if (n.lower() == "windows" or n.lower().startswith("windows"))
+              and n.lower() != "windowsapps"]
     # 稳定顺序：Windows 优先，其余按名称
     picked.sort(key=lambda n: (n.lower() != "windows", n.lower()))
     return [os.path.join(root, n) for n in picked]
