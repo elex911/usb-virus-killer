@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:/Users/Administrator/WorkBuddy/2026-11-19-12-13-08/usb-virus-killer/FolderVirusKiller.py'],
+    ['FolderVirusKiller.py'],  # 相对路径：CI 与本机均可构建（原绝对路径导致 CI 找不到脚本）
     pathex=[],
     binaries=[],
     datas=[],
