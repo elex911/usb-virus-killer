@@ -230,9 +230,61 @@ def test_restore_safety():
             mf2 = json.load(f)
         done = [i for i in mf2["items"] if i.get("action") == "quarantine"]
         assert len(done) == 1, "第 1 项已搬入隔离区但清单未记录: %r" % mf2
-        print("[OK] clean 中途中断：已隔离项 manifest 逐项落盘，可回滚")
+        assert all(i.get("status") == "compensated" for i in done), "中断后应补偿回滚，不留孤儿项: %r" % mf2
+        assert os.path.exists(targets[0]), "第 1 项补偿后应回到原路径"
+        assert not os.path.exists(os.path.join(qdirs[0], os.path.basename(targets[0]))), "隔离区不应残留孤儿"
+        print("[OK] clean 中途中断：逐项落盘 + 补偿回滚，无孤儿")
     finally:
         shutil.rmtree(tmp2, ignore_errors=True)
+
+
+def test_quarantine_metadata_and_summary():
+    """补强1：隔离元数据显示证据级、回滚摘要确认、SHA-256 篡改拒绝。"""
+    import unittest.mock as um
+    tmp = tempfile.mkdtemp(prefix="fk_meta_", dir=ROOT)
+    try:
+        usb = os.path.join(tmp, "usb")
+        os.makedirs(usb)
+        orig = os.path.join(usb, "证据.jpg")
+        with open(orig, "wb") as f:
+            f.write(b"original-evidence")
+        fv.set_attr(orig, fv.FILE_ATTRIBUTE_HIDDEN | fv.FILE_ATTRIBUTE_SYSTEM)
+        lnk = os.path.join(usb, "证据.lnk")
+        make_lnk(lnk, orig)
+        eng = fv.Engine(usb, False)
+        eng.precheck()
+        eng.scan(lambda m: None)
+        r = eng.clean(lambda m: None)
+        qdir = r["quarantine"]
+        mf_path = os.path.join(qdir, "manifest.json")
+        with open(mf_path, encoding="utf-8") as f:
+            mf = json.load(f)
+        assert mf.get("schema_version") == 2, mf
+        item = next(i for i in mf["items"] if i.get("action") == "quarantine")
+        assert len(item.get("sha256", "")) == 64, item
+        assert item.get("size") == os.path.getsize(os.path.join(qdir, item["rel"])), item
+        assert item.get("mtime_ns") and item.get("attrs") is not None, item
+        assert item.get("detection") and "确证特征" in item["detection"], item
+        assert os.path.isabs(item.get("original_path", "")), item
+
+        s = fv.Engine.restore_summary(qdir)
+        assert s["count"] >= 1 and s["time"] and s["root"] == usb, s
+        mod = fv.Module()
+        ctx = Context()
+        ctx.pick = qdir
+        text = mod.action_confirm("restore", ctx)
+        assert "SHA-256" in text and "原路径" in text and "项" in text, text
+
+        # 篡改隔离区文件 → SHA-256 不匹配必须拒绝回滚
+        qfile = os.path.join(qdir, item["rel"])
+        with open(qfile, "wb") as f:
+            f.write(b"tampered!")
+        okc, fail = fv.Engine.restore(qdir, lambda m: None)
+        assert okc == 0 and fail >= 1, (okc, fail)
+        assert not os.path.exists(lnk), "篡改文件不得被还原到原路径"
+        print("[OK] 隔离元数据/摘要确认/SHA-256 篡改拒绝")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_host_diagnostics():
@@ -629,8 +681,27 @@ def test_signature_db_pack():
         assert r3.ok and sig.load_db(db_path)["db_version"] == 2
         assert r3.report["replaced"] == 1 and r3.report["backup"], r3.report
 
-        r4 = mod.run("rollback_db", ctx, lambda m: None)
-        assert r4.ok and sig.load_db(db_path)["db_version"] == 1, r4.message
+        # 补强3：带 sha256 的完整包；篡改后整包拒绝且旧库不变；缺哈希给出警告
+        good = {"name": "testpack", "version": 3, "source": "example.org/pack-v3",
+                "rules": [rule]}
+        good["sha256"] = sig.rules_sha256(good["rules"])
+        ctx.pick = write_pack("p3.json", good)
+        r4 = mod.run("import_pack", ctx, lambda m: None)
+        assert r4.ok and r4.report.get("integrity") == "sha256-verified", r4.report
+        tampered = dict(good, version=4)
+        tampered["rules"] = [dict(rule, value=r"(?i)^evil\.exe$")]
+        ctx.pick = write_pack("p4-tampered.json", tampered)
+        r5 = mod.run("import_pack", ctx, lambda m: None)
+        assert not r5.ok and "完整性" in r5.message, r5.message
+        assert sig.load_db(db_path)["db_version"] == 3, "拒绝后旧库必须保留"
+        ctx.pick = write_pack("p5-legacy.json", {"name": "testpack", "version": 5,
+                                                  "source": "example.org/pack-v5", "rules": [rule]})
+        r6 = mod.run("import_pack", ctx, lambda m: None)
+        assert r6.ok and r6.report.get("integrity") == "not-provided", r6.report
+        print("[OK] 规则包 sha256 完整性/篡改拒绝/旧格式警告")
+
+        rr = mod.run("rollback_db", ctx, lambda m: None)
+        assert rr.ok and sig.load_db(db_path)["db_version"] == 3, rr.message
         print("[OK] 特征库 v2: 导入/重复拒/降级拒/坏包拒/替换计数/回滚 全链路")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -898,6 +969,187 @@ def test_report_export_contract():
         if isinstance(extra, dict):
             data.update(extra)
     print("[OK] 报告导出契约: 7 模块自声明字段 / 默认空 / app.py 无硬编码依赖")
+
+
+def test_report_iso():
+    """补强6：报告 ISO 生成、读回校验、容量上限拒绝；明确非引导盘。"""
+    from core import iso_writer as iw
+    tmp = tempfile.mkdtemp(prefix="fk_iso_", dir=ROOT)
+    try:
+        with open(os.path.join(tmp, "report.json"), "w", encoding="utf-8") as f:
+            f.write('{"scan": 1}')
+        with open(os.path.join(tmp, "摘要.TXT"), "w", encoding="utf-8") as f:
+            f.write("report\n")
+        out = os.path.join(tmp, "reports.iso")
+        r = iw.build_iso(tmp, out)
+        assert r["size"] % iw.SECTOR == 0 and r["size"] > iw.DATA_START * iw.SECTOR, r
+        assert r["sha256"] == iw._sha256_file(out)
+        vol, names = iw.read_back_check(out)
+        assert vol == "REPORT_ISO" and any(n == "REPORT.JSON;1" for n, _s in names), names
+        assert any(n == "SHA256SUMS.TXT;1" for n, _s in names), names
+        try:
+            iw.build_iso(tmp, os.path.join(tmp, "too_big.iso"), max_bytes=1024)
+            assert False, "超限必须拒绝"
+        except ValueError as e:
+            assert "上限" in str(e)
+        assert not os.path.exists(os.path.join(tmp, "too_big.iso"))
+        print("[OK] 报告 ISO: 生成/读回/清单/上限拒绝（内容刻录，非引导）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scan_edge_cases():
+    """补强5：只读文件、权限失败、压缩包不当容器展开、内容读取失败不崩。"""
+    import builtins
+    import stat as _stat
+    import zipfile
+    from core import scan_guard as sg
+    tmp = tempfile.mkdtemp(prefix="fk_edge_", dir=ROOT)
+    try:
+        # 只读文件：正常扫描且不改动内容
+        ro = os.path.join(tmp, "readonly.txt")
+        with open(ro, "wb") as f:
+            f.write(b"readonly-content")
+        os.chmod(ro, _stat.S_IREAD)
+        rule = {"id": "r_ro", "type": "sha256",
+                "value": sig.rules_sha256([{"x": 1}])[:0] + sig._hash_file(ro),
+                "source": "unit-test", "evidence": "T3", "first_seen": "2026-01-01"}
+        m, scanned, skipped, errors, _g = sig._scan_target(tmp, [rule], lambda x: None)
+        assert scanned >= 1 and any(x["id"] == "r_ro" for x in m), (m, errors)
+        with open(ro, "rb") as f:
+            assert f.read() == b"readonly-content"
+
+        # 权限失败/不可读：接缝注入 OSError，计数而不是崩溃
+        orig_lstat, orig_size = sg._lstat, os.path.getsize
+        def deny(p):
+            raise OSError("permission denied")
+        sg._lstat = deny
+        os.path.getsize = deny
+        try:
+            st = sg.new_stats()
+            rows = list(sg.walk_entries(tmp, st))
+            assert rows == [] and st["unreadable"] >= 1, st
+        finally:
+            sg._lstat, os.path.getsize = orig_lstat, orig_size
+            sg._reset_seams()
+
+        # 压缩包：作为单文件处理，不展开内部成员
+        arc = os.path.join(tmp, "sample.zip")
+        with zipfile.ZipFile(arc, "w") as z:
+            z.writestr("inner.lnk", "fake")
+        st2 = sg.new_stats()
+        paths = [p for p, _s, _d in sg.walk_entries(tmp, st2)]
+        assert arc in paths and not any(p.endswith("inner.lnk") for p in paths), paths
+
+        # 内容正则读取失败：记 errors，不抛出
+        cr = {"id": "r_cr", "type": "content_regex", "value": "x",
+              "source": "unit-test", "evidence": "T3", "first_seen": "2026-01-01"}
+        orig_open = builtins.open
+        def bad_open(p, *a, **kw):
+            if str(p) == ro:
+                raise OSError("disk.full simulated")
+            return orig_open(p, *a, **kw)
+        builtins.open = bad_open
+        try:
+            m2, _sc, _sk, errs2, _g2 = sig._scan_target(tmp, [cr], lambda x: None)
+        finally:
+            builtins.open = orig_open
+        assert any("disk.full" in e for e in errs2), errs2
+        print("[OK] 边界用例: 只读/权限失败/压缩包不展开/读取失败记错不崩")
+    finally:
+        os.chmod(os.path.join(tmp, "readonly.txt"), _stat.S_IWRITE | _stat.S_IREAD)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_report_tools_export_and_audit():
+    """补强4：三格式导出、脱敏、引擎/库状态泛化提取、审计日志追加。"""
+    import csv as _csv
+    from core import report_tools as rt
+    tmp = tempfile.mkdtemp(prefix="fk_report_", dir=ROOT)
+    try:
+        full = "180" + "7090" + "7766"
+        data = {
+            "time": "2026-11-22T00:00:00",
+            "meta": {"version": "v2.0", "target": "C:" + chr(92) + "Users" + chr(92) + "zhangsan" + chr(92) + "usb"},
+            "module_results": {
+                "signature_db": {"module": "本地特征库", "action": "scan", "ok": True,
+                                 "report": {"db_version": 3, "rule_count": 2, "updated_at": "2026-11-20",
+                                            "matches": [{"type": "sha256", "level": "命中",
+                                                         "path": r"C:\Users\zhangsan\usb\a.exe",
+                                                         "value": full}]}},
+                "clamav_bridge": {"module": "ClamAV", "action": "scan", "ok": True,
+                                  "report": {"version": "1.0", "arch": "x64", "matches": []}},
+            },
+        }
+        assert rt.anonymize(full) == "<手机号>"
+        assert r"C:\Users\zhangsan" not in rt.anonymize(data["meta"]["target"])
+        built = rt.build_report([], data["module_results"], data["meta"])
+        assert len(built["status"]["engines"]) == 1 and built["status"]["engines"][0]["name"] == "ClamAV"
+        assert built["status"]["databases"][0]["version"] == 3
+
+        pj = rt.export(built, "json", os.path.join(tmp, "r.json"))
+        with open(pj, encoding="utf-8") as f:
+            txt = f.read()
+        assert full not in txt and "<手机号>" in txt
+        pc = rt.export(built, "csv", os.path.join(tmp, "r.csv"))
+        with open(pc, encoding="utf-8-sig", newline="") as f:
+            rows = list(_csv.DictReader(f))
+        assert len(rows) == 1 and rows[0]["等级"] == "命中"
+        pt = rt.export(built, "txt", os.path.join(tmp, "r.txt"))
+        with open(pt, encoding="utf-8") as f:
+            t = f.read()
+        assert "引擎状态" in t and "数据库状态" in t and full not in t
+
+        rt.append_audit(tmp, {"module": "U盘文件查杀", "action": "clean", "ok": True,
+                              "target": r"C:\Users\zhangsan\usb"})
+        rt.append_audit(tmp, {"module": "经典木马", "action": "fix", "ok": False})
+        with open(os.path.join(tmp, "audit.log"), encoding="utf-8") as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        assert len(lines) == 2 and "zhangsan" not in lines[0]["target"], lines
+        print("[OK] 审计报告: 三格式/脱敏/状态聚合/审计追加")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_scan_guard_boundaries():
+    """补强2：重解析点剪枝 / 体积上限 / 深度上限 / 不可读计数 / 接缝可注入。"""
+    from core import scan_guard as sg
+    B = chr(92)
+
+    class S:
+        def __init__(self, mode=0, attrs=0):
+            self.st_mode = mode
+            self.st_file_attributes = attrs
+
+    root = "C:" + B + "scan_root"
+    reparse_dir = os.path.join(root, "junction")
+    reparse_file = os.path.join(root, "link.lnk")
+    big = os.path.join(root, "big.bin")
+    normal = os.path.join(root, "ok.txt")
+    trees = [(root, ["junction", "sub"], ["link.lnk", "big.bin", "ok.txt"]),
+             (os.path.join(root, "sub"), [], ["deep.txt"])]
+    sizes = {big: 500, normal: 3, os.path.join(root, "sub", "deep.txt"): 4}
+
+    orig = (sg._lstat, sg._walk)
+    sg._lstat = lambda p: S(attrs=sg.FILE_ATTRIBUTE_REPARSE_POINT) if p in (reparse_dir, reparse_file) else S()
+    sg._walk = lambda r: iter(trees)
+    orig_size = os.path.getsize
+    os.path.getsize = lambda p: sizes[p]
+    try:
+        st = sg.new_stats()
+        rows = [p for p, _sz, _isdir in sg.walk_entries(root, st, max_file_bytes=100, max_depth=4)]
+        assert normal in rows and os.path.join(root, "sub", "deep.txt") in rows, rows
+        assert reparse_file not in rows and big not in rows, rows
+        assert st["skipped_reparse"] == 2 and st["skipped_large"] == 1, st
+        assert st["scanned"] == 2, st
+
+        st2 = sg.new_stats()
+        list(sg.walk_entries(root, st2, max_depth=1))
+        assert st2["skipped_depth"] >= 1, st2
+    finally:
+        sg._lstat, sg._walk, os.path.getsize = orig[0], orig[1], orig_size
+        sg._reset_seams()
+    print("[OK] 扫描边界: 重解析点剪枝/体积与深度上限/统计口径")
 
 
 def test_gui_assembly():

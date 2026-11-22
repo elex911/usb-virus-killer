@@ -6,6 +6,7 @@
 不认识任何具体病毒判据；新增功能只需添加模块，无需修改这里。
 """
 import json
+import os
 import queue
 import threading
 import traceback
@@ -16,6 +17,8 @@ from tkinter import ttk, filedialog, messagebox
 
 from .api import ActionResult, Context
 from .registry import app_dir, load_modules
+from . import report_tools
+from . import iso_writer as report_tools_iso
 
 APP_TITLE = "模块化病毒查杀工具"
 APP_VER = "2.0"
@@ -102,7 +105,9 @@ class App:
         global_box.grid(row=grow, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
         self.b_export = ttk.Button(global_box, text="导出报告", command=self._export)
         self.b_export.grid(row=0, column=0, sticky="w")
-        self.all_buttons.append(self.b_export)
+        self.b_iso = ttk.Button(global_box, text="生成报告ISO", command=self._export_iso)
+        self.b_iso.grid(row=0, column=1, sticky="w", padx=(6, 0))
+        self.all_buttons.extend([self.b_export, self.b_iso])
 
         # 标签页：完全由模块的 build_view() 生成
         self.nb = ttk.Notebook(frm)
@@ -212,9 +217,7 @@ class App:
             self.ctx.is_drive = False
             self.ctx.allow_fixed = bool(self.allow_fixed.get())
 
-        if action.confirm and not messagebox.askyesno("确认", action.confirm):
-            return
-
+        # 先取目标再确认：确认框可依据 ctx.pick 显示动态摘要（如回滚清单）
         self.ctx.pick = ""
         if action.prompt == "directory":
             pick = filedialog.askdirectory(title=action.prompt_title or "选择目录")
@@ -229,6 +232,16 @@ class App:
             if not pick:
                 return
             self.ctx.pick = pick
+
+        confirm = action.confirm
+        try:
+            dynamic = mod.action_confirm(action.id, self.ctx, lambda m: self._log(m))
+            if dynamic:
+                confirm = dynamic
+        except Exception as exc:
+            self._log("动态确认生成失败，沿用静态确认：%s" % exc)
+        if confirm and not messagebox.askyesno("确认", confirm):
+            return
 
         self._set_busy(True)
         threading.Thread(target=self._worker, args=(mod, action), daemon=True).start()
@@ -280,6 +293,18 @@ class App:
                         "action": action_id,
                         "result": res,
                     }
+                    # 高风险操作写追加式审计日志（脱敏）；失败只记日志不影响主流程
+                    try:
+                        danger = any(a.id == action_id and a.danger for a in (mod.actions() if mod else []))
+                        if danger:
+                            report_tools.append_audit(self.ctx.app_dir, {
+                                "module": mod.meta.get("name", mid) if mod else mid,
+                                "action": action_id, "ok": res.ok,
+                                "target": self.ctx.target or self.ctx.pick,
+                                "summary": (res.message or "").splitlines()[:1],
+                            })
+                    except Exception as exc:
+                        self._log("[审计日志失败] %s" % exc)
                     if res.message and res.show_dialog:
                         title = res.title or (mod.meta.get("name", mid) if mod else "提示")
                         if res.ok:
@@ -307,33 +332,27 @@ class App:
         if not self.results:
             messagebox.showinfo("提示", "请先执行任一模块的扫描或诊断。")
             return
-        f = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+        f = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON 报告", "*.json"), ("CSV 清单", "*.csv"), ("文本摘要", "*.txt")],
+        )
         if not f:
             return
-        data = {
-            "time": datetime.now().isoformat(),
-            "version": APP_VER,
-            "target": self.ctx.target,
-            "loaded_modules": [
-                {
-                    "id": m.meta.get("id"),
-                    "name": m.meta.get("name"),
-                    "version": m.meta.get("version"),
-                    "description": m.meta.get("description"),
-                }
-                for m in self.modules
-            ],
-            "module_results": {},
-        }
+        fmt = os.path.splitext(f)[1].lower().lstrip(".") or "json"
+        do_mask = messagebox.askyesno("脱敏", "导出前脱敏手机号与用户目录？（建议：对外分享时选是）")
+
+        module_results = {}
+        data = {}
         # 各模块经契约钩子自行声明要提升到报告顶层的字段（如 v1.x 兼容字段）；
         # 主程序不认识具体字段名
         for mid, rec in self.results.items():
             res = rec["result"]
-            data["module_results"][mid] = {
+            module_results[mid] = {
                 "module": rec["module"],
                 "action": rec["action"],
                 "time": rec["time"],
                 "ok": res.ok,
+                "message": res.message,
                 "report": res.report if res.report is not None else res.data,
             }
             mod = self.module_by_id.get(mid)
@@ -347,13 +366,38 @@ class App:
             if isinstance(extra, dict):
                 data.update(extra)
 
-        data["caution"] = (
-            "主机诊断字段为只读疑点登记（高危/关注/信息），非病毒确认，未做任何修改。"
-        )
+        data.update(report_tools.build_report(
+            self.modules, module_results,
+            {"version": APP_VER, "target": self.ctx.target},
+        ))
+        try:
+            report_tools.export(data, fmt, f, do_anonymize=bool(do_mask))
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc))
+            return
+        self._log("报告已导出（%s%s）：%s" % (fmt.upper(), "·已脱敏" if do_mask else "", f))
 
-        with open(f, "w", encoding="utf-8") as fp:
-            json.dump(data, fp, ensure_ascii=False, indent=2, default=str)
-        self._log("报告已导出：" + f)
+
+    def _export_iso(self):
+        src = filedialog.askdirectory(title="选择存放报告文件的目录（仅内容刻录，非引导盘）")
+        if not src:
+            return
+        out = filedialog.asksaveasfilename(
+            title="保存报告 ISO", defaultextension=".iso", filetypes=[("ISO 镜像", "*.iso")])
+        if not out:
+            return
+        try:
+            r = report_tools_iso.build_iso(src, out)
+        except Exception as exc:
+            messagebox.showerror("生成 ISO 失败", str(exc))
+            return
+        messagebox.showinfo(
+            "报告 ISO 已生成",
+            "文件：%s\n大小：%.1f MiB\n报告文件：%d 个\nSHA-256：%s\n\n"
+            "这是数据光盘镜像（内容刻录），不是启动盘；引导需完整 WinPE 环境。"
+            % (r["path"], r["size"] / 1048576, r["files"], r["sha256"]),
+        )
+        self._log("报告 ISO 已生成：" + r["path"])
 
 
 def main():

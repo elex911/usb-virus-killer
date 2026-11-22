@@ -49,6 +49,21 @@
 | 2 | ClamAV 为可选外部依赖，未装环境下 ClamAV 模块行为=「未找到引擎」提示（有测试锚定） | 低 | 保持现状 |
 | 3 | 免疫对已存在 autorun.inf 只拒绝不代删（有意设计，红线「不删用户文件」） | 低 | 保持现状，文档已注明 |
 
+## 十一、补强后追加验收（2026-11-22 下午）
+
+用户提出十项补强建议；元审查结果：4 项已有（不重造）、3 项错误前提（原子事务/数字签名/启动盘，按诚实原则降级）、7 项真增量已落地并逐项测试先行验证：
+
+| 补强 | 实现 | 验证 |
+|---|---|---|
+| 隔离事务 | manifest schema=2，逐项 SHA-256/路径/时间戳/属性/检测来源；逐项落盘+中断补偿；回滚前摘要确认+SHA-256 校验+不覆盖 | pytest `test_quarantine_metadata_and_summary` / `test_restore_safety` |
+| 扫描边界 | `core/scan_guard.py` 跳重解析点/软链/junction，限制体积与深度；三模块接入；统一「已扫描/跳过/无法读取/检测/未知」 | pytest `test_scan_guard_boundaries` / `test_scan_edge_cases`（只读/权限/压缩包/读失败） |
+| 离线包完整性 | `sha256` 规范化哈希防篡改/防半包；失败旧库不变；缺哈希旧格式警告；明确不声称数字签名 | pytest `test_signature_db_pack` 新增 3 断言 |
+| 可审计报告 | `core/report_tools.py` JSON/CSV/文本三格式、脱敏、引擎与库状态泛化提取；`audit.log` 追加审计 | pytest `test_report_tools_export_and_audit` |
+| CI | `.github/workflows/build.yml`：pytest+测试台+PyInstaller+SHA256SUMS+制品；bandit/pip-audit 非阻断 | 标准库结构校验（顶层4键/10步骤/关键步骤齐全） |
+| 报告 ISO | `core/iso_writer.py` 纯标准库 ISO9660 内容刻录，上限 4.3GiB、SHA256SUMS、读回校验；GUI 按钮；明确非引导盘 | pytest `test_report_iso`；PVD 字段 bug（8字节切片）已修复并回归 |
+
+追加终验：pytest **24/24** → 测试台 **18/18** → exe 重打包 + 内嵌 VERIFY PASS → 烟测窗口标题 → 文档-代码-spec 三向比对 PASS（模块表 7=注册 7=hidden-import 7=spec 7，新增 4 个 core 模块在 spec）。
+
 ## 附注 A：企业流程不适用项的取舍说明
 
 以下环节因「开发方=使用方」而空转，未纳入本次验收，其可迁移内核已吸收：签字/付款节点（无交易）、第三方 CMA/CNAS（无审计与追责需求）、30/60 天试运行（个人工具以「每次使用即验收」替代，回归测试集即基线）。吸收的内核：RTM、准入门槛、缺陷分级闭环、证据链、独立复验（对应「别用开发自测代替验收」）。

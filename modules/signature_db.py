@@ -17,6 +17,7 @@ from datetime import datetime
 
 from . import folder_virus as fv
 from core.api import Action, ActionResult, ModuleBase
+from core import scan_guard
 from core.widgets import ResultTable
 
 DB_FILENAME = "signature_db.json"
@@ -255,6 +256,12 @@ def latest_backup(path):
     return os.path.join(bdir, files[-1]) if files else ""
 
 
+def rules_sha256(rules):
+    """规则集合规范化哈希：防篡改/防半包。签名验证需外部信任根，本工具不假称具备。"""
+    canonical = json.dumps(rules, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def _hash_file(path):
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -271,55 +278,50 @@ def _scan_target(root, enabled, log):
     errors = []
     scanned = skipped = 0
 
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if "__WORM_QUARANTINE_" not in d]
-        for fn in filenames:
-            p = os.path.join(dirpath, fn)
-            if "__WORM_QUARANTINE_" in p:
-                continue
+    guard_stats = scan_guard.new_stats()
+    for p, size, _isdir in scan_guard.walk_entries(
+            root, guard_stats,
+            skip_dir=lambda n: "__WORM_QUARANTINE_" in n,
+            max_file_bytes=MAX_FILE_BYTES):
+        scanned += 1
+        fn = os.path.basename(p)
+        for rule in enabled:
             try:
-                size = os.path.getsize(p)
+                typ = rule["type"]
+                value = rule["value"]
+                hit = False
+                method = {"sha256": "文件哈希", "filename_regex": "特征(文件名)",
+                          "content_regex": "特征(内容)"}.get(typ, "未知")
+                if typ == "sha256":
+                    hit = _hash_file(p) == value.lower()
+                elif typ == "filename_regex":
+                    hit = bool(re.search(value, fn, re.I))
+                elif typ == "content_regex":
+                    with open(p, "rb") as f:
+                        raw = f.read(MAX_CONTENT_BYTES)
+                    text = raw.decode("utf-8", errors="ignore") + "\n" + \
+                           raw.decode("latin-1", errors="ignore")
+                    hit = bool(re.search(value, text, re.I))
+                if hit:
+                    matches.append({
+                        "id": rule["id"],
+                        "type": typ,
+                        "method": method,
+                        "level": "命中",
+                        "path": p,
+                        "value": value[:160],
+                        "source": rule["source"],
+                        "evidence": rule["evidence"],
+                        "first_seen": rule["first_seen"],
+                    })
             except Exception as exc:
-                skipped += 1
-                errors.append("%s: 读取大小失败 %s" % (p, exc))
-                continue
-            if size > MAX_FILE_BYTES:
-                skipped += 1
-                continue
-            scanned += 1
+                errors.append("%s / %s: 匹配失败 %s" % (rule["id"], p, exc))
 
-            for rule in enabled:
-                try:
-                    typ = rule["type"]
-                    value = rule["value"]
-                    hit = False
-                    if typ == "sha256":
-                        hit = _hash_file(p) == value.lower()
-                    elif typ == "filename_regex":
-                        hit = bool(re.search(value, fn, re.I))
-                    elif typ == "content_regex":
-                        with open(p, "rb") as f:
-                            raw = f.read(MAX_CONTENT_BYTES)
-                        text = raw.decode("utf-8", errors="ignore") + "\n" + \
-                               raw.decode("latin-1", errors="ignore")
-                        hit = bool(re.search(value, text, re.I))
-                    if hit:
-                        matches.append({
-                            "id": rule["id"],
-                            "type": typ,
-                            "level": "命中",
-                            "path": p,
-                            "value": value[:160],
-                            "source": rule["source"],
-                            "evidence": rule["evidence"],
-                            "first_seen": rule["first_seen"],
-                        })
-                except Exception as exc:
-                    errors.append("%s / %s: 匹配失败 %s" % (rule["id"], p, exc))
-
+    skipped = guard_stats["skipped_large"] + guard_stats["skipped_reparse"] + \
+              guard_stats["skipped_depth"] + guard_stats["unreadable"]
     log("特征库扫描完成：文件 %d 个，跳过 %d 个，命中 %d 条。"
         % (scanned, skipped, len(matches)))
-    return matches, scanned, skipped, errors
+    return matches, scanned, skipped, errors, guard_stats
 
 
 class Module(ModuleBase):
@@ -487,7 +489,7 @@ class Module(ModuleBase):
                     data={"rows": self._validate_rows(statuses, errors)},
                     report={"db_path": path, "matched": 0, "errors": errors},
                 )
-            matches, scanned, skipped, scan_errors = _scan_target(ctx.target, enabled, log)
+            matches, scanned, skipped, scan_errors, guard_stats = _scan_target(ctx.target, enabled, log)
             rows = list(matches) + [{
                 "id": "-", "type": "-", "level": "信息",
                 "path": "(汇总)",
@@ -512,6 +514,14 @@ class Module(ModuleBase):
                     "matches": matches,
                     "validation_errors": errors,
                     "scan_errors": scan_errors,
+                    "scan_stats": {
+                        "已扫描": scanned, "跳过": skipped,
+                        "重解析点跳过": guard_stats["skipped_reparse"],
+                        "超大跳过": guard_stats["skipped_large"],
+                        "超深跳过": guard_stats["skipped_depth"],
+                        "无法读取": guard_stats["unreadable"] + len(scan_errors),
+                        "检测": len(matches), "未知": len(scan_errors),
+                    },
                     "caution": CAUTION,
                 },
             )
@@ -641,6 +651,16 @@ class Module(ModuleBase):
             errs.append("版本必须大于当前库版本 %d（禁止降级）" % cur_ver)
         if isinstance(version, int) and version in imported_versions:
             errs.append("版本 %d 已导入过，禁止重复导入" % version)
+
+        integrity = "not-provided"
+        declared = str(pack.get("sha256") or "").strip().lower()
+        if declared:
+            if not re.fullmatch(r"[0-9a-f]{64}", declared):
+                errs.append("sha256 字段必须是 64 位十六进制")
+            elif isinstance(rules, list) and rules_sha256(rules) != declared:
+                errs.append("完整性校验失败：规则内容与 sha256 不符（疑似篡改或下载不完整）；旧库未改动")
+            else:
+                integrity = "sha256-verified"
         if errs:
             return ActionResult(
                 action=action_id, ok=False, show_dialog=True, title="导入规则包",
@@ -668,7 +688,11 @@ class Module(ModuleBase):
         packs = list(db.get("packs", []))
         packs.append({
             "name": name, "version": version, "source": source,
+            "updated_at": str(pack.get("updated_at") or ""),
             "sha256": _hash_file(pack_path),
+            "rules_sha256": rules_sha256(rules),
+            "integrity": integrity,
+            "signature_verified": False,  # 无外部信任根/证书，不声称数字签名
             "imported_at": datetime.now().isoformat(),
             "rule_count": len(rules), "replaced": replaced,
         })
@@ -683,15 +707,18 @@ class Module(ModuleBase):
             json.dump(new_db, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
         log("规则包已导入：v%d，规则 %d 条（替换 %d 条）。" % (version, len(rules), replaced))
+        notice = ("完整性校验：SHA-256 通过" if integrity == "sha256-verified"
+                  else "完整性提示：本包未提供 sha256，仅做版本与规则校验（无数字签名验证）")
         msg = ("规则包导入成功：%s v%d\n新增/更新 %d 条规则（替换同 id %d 条）；"
-               "库版本 %d → %d。\n备份：%s"
+               "库版本 %d → %d。\n%s\n备份：%s"
                % (name, version, len(rules), replaced, cur_ver, version,
-                  backup or "(原库为空，无备份)"))
+                  notice, backup or "(原库为空，无备份)"))
         return ActionResult(
             action=action_id, message=msg, title="导入规则包", show_dialog=True,
             data={"rows": [{"id": "-", "type": "-", "level": "信息",
                             "path": path, "value": msg}]},
             report={"imported": 1, "pack": name, "version": version,
                     "rule_count": len(rules), "replaced": replaced,
-                    "db_version": version, "backup": backup, "sha256": packs[-1]["sha256"]},
+                    "db_version": version, "backup": backup, "sha256": packs[-1]["sha256"],
+                    "integrity": integrity, "signature_verified": False},
         )

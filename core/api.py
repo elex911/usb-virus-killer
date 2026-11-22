@@ -94,6 +94,13 @@ class ModuleBase:
         """表格双击详情文本。"""
         return "\n".join("%s：%s" % (k, v) for k, v in row.items())
 
+    def action_confirm(self, action_id: str, ctx: Context, log=lambda m: None):
+        """执行前动态确认文本（主线程调用）；None 表示沿用 Action.confirm 静态文本。
+
+        用于需要在确认框展示真实数据摘要的动作（如回滚前显示隔离清单）。
+        """
+        return None
+
     def report_export(self, result: "ActionResult") -> Dict[str, Any]:
         """导出 JSON 报告时本模块贡献的顶层字段；默认不贡献任何字段。
 

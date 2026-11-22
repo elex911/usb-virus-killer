@@ -1,0 +1,52 @@
+name: Build & Verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build & test dependencies
+        run: python -m pip install --upgrade pip pytest pyinstaller bandit pip-audit
+      - name: Unit & integration tests
+        run: python -m pytest tests/test_modular.py -q
+      - name: Testbed (18 scenarios, synthetic/EICAR samples only)
+        run: python testbed/run_testbed.py
+      - name: Static analysis (advisory, non-blocking)
+        continue-on-error: true
+        run: python -m bandit -r core modules -ll
+      - name: Dependency audit (advisory, non-blocking)
+        continue-on-error: true
+        run: python -m pip_audit
+      - name: Build single-file exe
+        run: python -m PyInstaller "文件夹病毒查杀工具.spec" --noconfirm
+      - name: SHA-256 manifest
+        shell: bash
+        run: |
+          cd dist
+          sha256sum *.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: usb-virus-killer-exe
+          path: |
+            dist/*.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+# 说明：代码签名需证书私钥（不入库）；本项目仅生成 SHA-256 校验清单。
+# 正式发布前可做 SAST/依赖审计特判与误报申诉，详见使用说明.md「误报申诉」。

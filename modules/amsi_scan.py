@@ -20,6 +20,7 @@ import ctypes
 import os
 
 from core.api import Action, ActionResult, ModuleBase
+from core import scan_guard
 from core.widgets import ResultTable
 
 try:
@@ -79,23 +80,29 @@ def _default_amsi_scan(api, data, content_name):
     return hr, result.value
 
 
+_last_scan_stats = {}
+
+
 def _default_script_files(root):
+    global _last_scan_stats
     out = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if SCAN_CHARDIR_SKIP not in d]
-        for fn in filenames:
-            if os.path.splitext(fn)[1].lower() in SCRIPT_EXTS:
-                p = os.path.join(dirpath, fn)
-                if SCAN_CHARDIR_SKIP not in p:
-                    out.append(p)
+    stats = scan_guard.new_stats()
+    for p, _size, _isdir in scan_guard.walk_entries(
+            root, stats,
+            skip_dir=lambda n: SCAN_CHARDIR_SKIP in n,
+            max_file_bytes=MAX_FILE_BYTES):
+        if os.path.splitext(p)[1].lower() in SCRIPT_EXTS:
+            out.append(p)
+    _last_scan_stats = stats
     return out
 
 
 def _reset_seams():
-    global _load_amsi, _amsi_scan, _script_files
+    global _load_amsi, _amsi_scan, _script_files, _last_scan_stats
     _load_amsi = _default_load_amsi
     _amsi_scan = _default_amsi_scan
     _script_files = _default_script_files
+    _last_scan_stats = {}
 
 
 _reset_seams()
@@ -250,7 +257,15 @@ class Module(ModuleBase):
             report={
                 "amsi": {"available": True, "script_count": len(files),
                          "scanned": len(files) - skipped, "skipped": skipped,
-                         "detected": n_high, "suspicious": n_warn},
+                         "detected": n_high, "suspicious": n_warn,
+                         "scan_stats": {
+                             "已扫描": len(files) - skipped, "跳过": skipped,
+                             "重解析点跳过": _last_scan_stats.get("skipped_reparse", 0),
+                             "超大跳过": _last_scan_stats.get("skipped_large", 0),
+                             "超深跳过": _last_scan_stats.get("skipped_depth", 0),
+                             "无法读取": _last_scan_stats.get("unreadable", 0),
+                             "检测": n_high + n_warn, "未知": skipped,
+                         }},
                 "caution": CAUTION,
             },
         )

@@ -10,6 +10,7 @@ U 盘文件夹病毒查杀模块
 """
 import ctypes
 import glob
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import shutil
 from datetime import datetime
 
 from core.api import Action, ActionResult, Context, ModuleBase
+from core import scan_guard
 from core.widgets import ResultTable
 
 FILE_ATTRIBUTE_READONLY = 0x1
@@ -162,21 +164,17 @@ class Engine:
 
     def scan(self, log):
         log("开始枚举文件（只读）…")
-        all_items = []
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            # 自身隔离区不重扫：已隔离对象不再判级/记隐藏（防止重扫复报与回滚干扰）
-            dirnames[:] = [d for d in dirnames if not d.startswith(QUARANTINE_PREFIX)]
-            for d in dirnames:
-                try:
-                    all_items.append(os.path.join(dirpath, d))
-                except Exception:
-                    pass
-            for fn in filenames:
-                try:
-                    all_items.append(os.path.join(dirpath, fn))
-                except Exception:
-                    pass
-        log("共枚举 %d 个对象。" % len(all_items))
+        # 统一扫描边界：重解析点/junction/软链不跟随、深度上限、隔离区剪枝
+        guard_stats = scan_guard.new_stats()
+        all_items = [p for p, _size, _isdir in scan_guard.walk_entries(
+            self.root, guard_stats,
+            skip_dir=lambda n: n.startswith(QUARANTINE_PREFIX),
+            include_dirs=True,
+        )]
+        self.meta["scan_stats"] = dict(guard_stats)
+        log("共枚举 %d 个对象（重解析点跳过 %d，超深 %d，不可读 %d）。"
+            % (len(all_items), guard_stats["skipped_reparse"],
+               guard_stats["skipped_depth"], guard_stats["unreadable"]))
 
         hidden = []
         for p in all_items:
@@ -252,12 +250,37 @@ class Engine:
         self.meta["stats"] = stats
         return stats
 
+    @staticmethod
+    def _sha256_file(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    @staticmethod
+    def _capture_meta(path, item):
+        """隔离前取证：SHA-256、大小、时间戳、属性、检测来源（T1 原始量，manifest 为 T2 载体）。"""
+        st = os.stat(path)
+        return {
+            "sha256": Engine._sha256_file(path),
+            "size": st.st_size,
+            "mtime_ns": st.st_mtime_ns,
+            "atime_ns": st.st_atime_ns,
+            "ctime_ns": st.st_ctime_ns,
+            "attrs": get_attr(path),
+            "detection": item.get("reason") or item.get("verdict") or "",
+            "original_path": os.path.abspath(path),
+            "status": "quarantined",
+        }
+
     def clean(self, log, do_restore_attrs=True):
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         qdir = os.path.join(self.root, QUARANTINE_PREFIX + stamp)
         os.makedirs(qdir, exist_ok=True)
         targets = [i for i in self.items if i["verdict"] == "恶意"]
-        manifest = {"time": datetime.now().isoformat(), "root": self.root, "items": []}
+        manifest = {"schema_version": 2, "tool": "usb-virus-killer v2.0",
+                    "time": datetime.now().isoformat(), "root": os.path.abspath(self.root), "items": []}
 
         def _flush():
             # manifest 逐项落盘：隔离中途崩溃（断电/Ctrl+C）已搬入项仍可回滚
@@ -266,20 +289,43 @@ class Engine:
 
         _flush()
         moved = 0
-        for it in targets:
-            p = it["path"]
-            if not os.path.exists(p):
-                continue
-            rel = os.path.relpath(p, self.root)
-            dest = os.path.join(qdir, rel)
-            try:
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                shutil.move(p, dest)
-                manifest["items"].append({"action": "quarantine", "rel": rel})
-                moved += 1
-                _flush()
-            except Exception as e:
-                log("隔离失败 %s : %s" % (p, e))
+        try:
+            for it in targets:
+                p = it["path"]
+                if not os.path.exists(p):
+                    continue
+                rel = os.path.relpath(p, self.root)
+                dest = os.path.join(qdir, rel)
+                entry = {"action": "quarantine", "rel": rel}
+                try:
+                    entry.update(Engine._capture_meta(p, it))  # 必须在移动前取证
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.move(p, dest)
+                    manifest["items"].append(entry)
+                    moved += 1
+                    _flush()
+                except (KeyboardInterrupt, SystemExit):
+                    raise  # 中断向上传播，由外层补偿
+                except Exception as e:
+                    log("隔离失败 %s : %s" % (p, e))
+        except (KeyboardInterrupt, SystemExit):
+            # 准事务补偿：已搬入项用 os.rename 直接还原（不受 shutil.move 注入影响），
+            # 不删任何项；清单标记 compensated，保证「已搬入 ⇒ 有记录 ⇒ 可追溯」
+            for entry in manifest["items"]:
+                if entry.get("action") != "quarantine":
+                    continue
+                src = os.path.join(qdir, entry["rel"])
+                dst = os.path.join(manifest["root"], entry["rel"])
+                if os.path.exists(src) and not os.path.exists(dst):
+                    try:
+                        os.rename(src, dst)
+                        entry["status"] = "compensated"
+                    except OSError as e:
+                        log("补偿回滚失败 %s : %s" % (entry["rel"], e))
+                        entry["status"] = "compensation_failed"
+            _flush()
+            log("已中断：%d 项已补偿回滚，清单保留取证。" % moved)
+            raise
         log("已隔离 %d 项 → %s" % (moved, qdir))
 
         restored = 0
@@ -302,6 +348,24 @@ class Engine:
             f.write("  python FolderVirusKiller.py --restore \"%s\"\n\n" % qdir)
             f.write("确认无误后再删除本目录。不要双击目录内的快捷方式。\n")
         return {"moved": moved, "restored": restored, "quarantine": qdir}
+
+    @staticmethod
+    def restore_summary(qdir):
+        """回滚前摘要（主线程显示，供用户确认；异常返回空摘要不阻断）。"""
+        summary = {"time": "", "root": "", "count": 0, "size_total": 0, "sources": []}
+        try:
+            with open(os.path.join(qdir, "manifest.json"), encoding="utf-8") as f:
+                mf = json.load(f)
+            items = [i for i in mf.get("items", []) if i.get("action") == "quarantine"
+                     and i.get("status") == "quarantined"]
+            summary["time"] = mf.get("time", "")
+            summary["root"] = mf.get("root", "")
+            summary["count"] = len(items)
+            summary["size_total"] = sum(int(i.get("size", 0) or 0) for i in items)
+            summary["sources"] = sorted(set(str(i.get("detection", "")) for i in items if i.get("detection")))
+        except Exception:
+            pass
+        return summary
 
     @staticmethod
     def restore(qdir, log):
@@ -328,6 +392,18 @@ class Engine:
             if not os.path.exists(src):
                 fail += 1
                 continue
+            expected = str(it.get("sha256") or "")
+            if len(expected) == 64:
+                try:
+                    actual = Engine._sha256_file(src)
+                except OSError as e:
+                    log("回滚拒绝（无法校验 SHA-256）：%s : %s" % (rel, e))
+                    fail += 1
+                    continue
+                if actual.lower() != expected.lower():
+                    log("回滚拒绝（SHA-256 不符，隔离文件可能被篡改）：%s" % rel)
+                    fail += 1
+                    continue
             if os.path.exists(dst):
                 # 不覆盖用户现有文件：宁可该项回滚失败留给人工，也不静默吞掉现状
                 log("回滚跳过（目标已存在，不覆盖）：%s" % dst)
@@ -383,6 +459,24 @@ class Module(ModuleBase):
                    target_mode="none", prompt="directory",
                    prompt_title="选择隔离目录（__WORM_QUARANTINE_...）", order=40),
         ]
+
+    def action_confirm(self, action_id, ctx, log=lambda m: None):
+        """回滚前展示隔离清单摘要（含 SHA-256 取证说明）；读不到清单则退回静态确认。"""
+        if action_id != "restore" or not getattr(ctx, "pick", ""):
+            return None
+        try:
+            s = Engine.restore_summary(ctx.pick)
+        except Exception:
+            return None
+        if not s["count"]:
+            return None
+        return (
+            "回滚前请核对隔离清单摘要：\n"
+            "隔离时间：%s\n原路径：%s\n条目：%d 项（合计 %d 字节）\n检测来源：%s\n\n"
+            "回滚前逐项校验 SHA-256；目标已存在同名文件时不覆盖，跳过留人工。\n继续？"
+            % (s["time"] or "未知", s["root"] or "未知", s["count"], s["size_total"],
+               "、".join(s["sources"]) or "见清单")
+        )
 
     def prepare_context(self, ctx, raw_target, allow_fixed=False):
         path, is_drive = norm_target(raw_target)
