@@ -64,6 +64,8 @@
 
 追加终验：pytest **24/24** → 测试台 **18/18** → exe 重打包 + 内嵌 VERIFY PASS → 烟测窗口标题 → 文档-代码-spec 三向比对 PASS（模块表 7=注册 7=hidden-import 7=spec 7，新增 4 个 core 模块在 spec）。
 
+**CI 最终结论：通过**（run `44981738142`（https://github.com/elex911/usb-virus-killer/actions/runs/44981738142），commit `9d6c20b`，产物 `usb-virus-killer-exe` 11,403,666 bytes 含 exe + SHA256SUMS.txt）。从首跑 failure 到 success 共闭环三处「本地绿灯掩盖的 CI 缺口」：①ClamAV 测试依赖本机引擎（注入 `find_clamscan` 接缝）；②runner 控制台 cp1252 无法打印中文（`PYTHONIOENCODING=utf-8`）；③spec 写死本机绝对路径（改相对路径）。三者均为测试/构建配置缺陷，非被测业务逻辑缺陷。
+
 **CI 首跑暴露的环境缺口（已闭环）**：本地有 `clamscan.exe`，CI 无——两个 ClamAV 测试用例只注入了进程调用未注入引擎路径，测试台场景 08/09 也直接读 `res.report`。这属于**测试缺陷非软件缺陷**（本地绿灯是假绿）。修复：用例注入 `find_clamscan` 接缝；测试台在无引擎时如实标记「跳过」而非崩溃。双环境验证：模拟无引擎与真实环境均 pytest 24/24、测试台 18/18。git 传输通道曾 502/重置，改用 Git Data API 推对象 + 重建 commit 哈希对齐（远端 `734addb`），通道恢复后正常推送 `24846e8`。
 
 ## 附注 A：企业流程不适用项的取舍说明
